@@ -1,0 +1,7 @@
+logs/
+*.log
+*.jsonl
+.env
+.env.*
+poly_maker/target*/
+__pycache__/
