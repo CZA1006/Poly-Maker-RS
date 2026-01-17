@@ -142,6 +142,12 @@ def main():
                         "unhedged_down",
                         "unhedged_value_up",
                         "unhedged_value_down",
+                        "spent_total_usdc",
+                        "spent_round_usdc",
+                        "round_idx",
+                        "round_state",
+                        "round_leg1",
+                        "round_qty_target",
                     ]:
                         if key not in decision:
                             decision[key] = last_snapshot.get(key)
@@ -234,6 +240,12 @@ def main():
                 decision.get("unhedged_down"),
                 decision.get("unhedged_value_up"),
                 decision.get("unhedged_value_down"),
+                decision.get("spent_total_usdc"),
+                decision.get("spent_round_usdc"),
+                decision.get("round_idx"),
+                decision.get("round_state"),
+                decision.get("round_leg1"),
+                decision.get("round_qty_target"),
                 decision.get("best_action_action"),
                 decision.get("best_action_kind"),
                 decision.get("best_action_leg"),
@@ -270,6 +282,12 @@ def main():
                 "unhedged_down",
                 "unhedged_value_up",
                 "unhedged_value_down",
+                "spent_total_usdc",
+                "spent_round_usdc",
+                "round_idx",
+                "round_state",
+                "round_leg1",
+                "round_qty_target",
                 "best_action_action",
                 "best_action_kind",
                 "best_action_leg",
@@ -312,6 +330,11 @@ def main():
                 snap.get("unhedged_value_down"),
                 snap.get("qty_up"),
                 snap.get("qty_down"),
+                snap.get("spent_total_usdc"),
+                snap.get("spent_round_usdc"),
+                snap.get("round_idx"),
+                snap.get("round_state"),
+                snap.get("round_leg1"),
             ]
         )
 
@@ -328,6 +351,11 @@ def main():
                 "unhedged_value_down",
                 "qty_up",
                 "qty_down",
+                "spent_total_usdc",
+                "spent_round_usdc",
+                "round_idx",
+                "round_state",
+                "round_leg1",
             ]
         )
         writer.writerows(timeseries_rows)
@@ -413,7 +441,7 @@ def main():
     summary_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in decisions_rows[:20]:
         summary_lines.append(
-            f"| {row[0]} | {row[1]} | {row[2]} | {row[4]} | {row[5]} | {row[10]} | {row[13]} | {row[14]} | {row[15]} | {row[20]} | {row[26]} | {row[27]} | {row[28]} |"
+            f"| {row[0]} | {row[1]} | {row[2]} | {row[4]} | {row[5]} | {row[10]} | {row[13]} | {row[14]} | {row[21]} | {row[26]} | {row[32]} | {row[33]} | {row[34]} |"
         )
     summary_lines.append("")
     summary_lines.append("## Deny Reasons (top 10)")

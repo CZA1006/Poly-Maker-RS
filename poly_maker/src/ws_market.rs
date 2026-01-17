@@ -127,7 +127,7 @@ struct RolloverLogContext {
     rollover_gen: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TradeLeg {
     Up,
     Down,
@@ -161,6 +161,13 @@ enum ApplyKind {
     BestTakerOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundPhase {
+    Idle,
+    Leg1Filled,
+    Done,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DenyReason {
     TakerDisabled,
@@ -168,14 +175,19 @@ enum DenyReason {
     NoImprove,
     Cooldown,
     NoQuote,
+    TotalBudgetCap,
+    RoundBudgetCap,
+    ReserveForPair,
     LegCapValueUp,
     LegCapValueDown,
     LegCapSharesUp,
     LegCapSharesDown,
     TailFreeze,
     TailClose,
-    LockedNoExpand,
-    LockedKeepBalance,
+    LockedMaxRounds,
+    LockedTailFreeze,
+    LockedWaitingPair,
+    LockedPolicyHold,
 }
 #[derive(Debug, Clone, Copy)]
 struct CandidateAction {
@@ -194,6 +206,7 @@ struct SimResult {
     fill_price: Option<f64>,
     #[allow(dead_code)]
     fee_estimate: f64,
+    spent_delta_usdc: f64,
     new_qty_up: f64,
     new_cost_up: f64,
     new_qty_down: f64,
@@ -215,14 +228,21 @@ struct SimResult {
 struct GateResult {
     allow: bool,
     deny_reason: Option<DenyReason>,
+    can_start_new_round: bool,
+    budget_remaining_round: f64,
+    budget_remaining_total: f64,
+    reserve_needed_usdc: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 struct DryRunParams {
-    qty: f64,
     improve_min: f64,
     margin_target: f64,
     safety_margin: f64,
+    total_budget_usdc: f64,
+    max_rounds: u64,
+    round_budget_usdc: f64,
+    round_leg1_fraction: f64,
     max_unhedged_value: f64,
     cap_unhedged_value: Option<f64>,
     max_unhedged_shares: Option<f64>,
@@ -254,6 +274,12 @@ struct DryRunLedger {
     cost_up: f64,
     qty_down: f64,
     cost_down: f64,
+    spent_total_usdc: f64,
+    spent_round_usdc: f64,
+    round_idx: u64,
+    round_state: RoundPhase,
+    round_leg1: Option<TradeLeg>,
+    round_qty_target: f64,
     best_bid_up: Option<f64>,
     best_ask_up: Option<f64>,
     best_bid_down: Option<f64>,
@@ -267,6 +293,19 @@ struct DryRunLedger {
     locked_pair_cost: Option<f64>,
     #[allow(dead_code)]
     locked_at_ts_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RoundPlan {
+    phase: RoundPhase,
+    planned_leg1: Option<TradeLeg>,
+    qty_target: Option<f64>,
+    balance_leg: Option<TradeLeg>,
+    balance_qty: Option<f64>,
+    can_start_new_round: bool,
+    budget_remaining_round: f64,
+    budget_remaining_total: f64,
+    reserve_needed_usdc: Option<f64>,
 }
 
 pub async fn run(config: &Config) -> Result<()> {
@@ -498,6 +537,9 @@ async fn connect_and_run(
                     dryrun.last_decision_ts_ms = now_ms;
                     dryrun.decision_seq = dryrun.decision_seq.saturating_add(1);
                     dryrun.update_from_cache(&cache);
+                    let now_ts = Utc::now().timestamp();
+                    let now_ts = u64::try_from(now_ts).unwrap_or(0);
+                    dryrun.update_round_state(&dryrun_params, now_ts);
                     dryrun.update_lock(&dryrun_params, now_ms);
                     let log_ctx = RolloverLogContext {
                         enabled: rollover_log_json,
@@ -527,7 +569,13 @@ async fn connect_and_run(
                     if let Some(applied) = applied {
                         if applied.gate.allow && applied.sim.ok {
                             log_dryrun_apply(&dryrun, &applied, &dryrun_params, &log_ctx);
-                            apply_simulated_trade(&mut dryrun, &applied.sim);
+                            apply_simulated_trade(
+                                &mut dryrun,
+                                &applied.action,
+                                &applied.sim,
+                                &dryrun_params,
+                                now_ts,
+                            );
                         }
                     }
                 }
@@ -1086,11 +1134,6 @@ fn read_gamma_log_throttle_ms() -> i64 {
 }
 
 fn read_dryrun_params() -> DryRunParams {
-    let qty = env::var("DRYRUN_QTY")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
-        .unwrap_or(10.0);
     let improve_min = env::var("DRYRUN_IMPROVE_MIN")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -1106,6 +1149,39 @@ fn read_dryrun_params() -> DryRunParams {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v >= 0.0)
         .unwrap_or(0.005);
+    let mut total_budget_usdc = env::var("TOTAL_BUDGET_USDC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(10.0);
+    let legacy_budget = env::var("MAX_NET_INV_USDC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+    if env::var("TOTAL_BUDGET_USDC").is_err() {
+        if let Some(value) = legacy_budget {
+            total_budget_usdc = value;
+            tracing::warn!(
+                total_budget_usdc = value,
+                "MAX_NET_INV_USDC is deprecated; use TOTAL_BUDGET_USDC"
+            );
+        }
+    }
+    let max_rounds = env::var("MAX_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2);
+    let round_budget_usdc = env::var("ROUND_BUDGET_USDC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or_else(|| total_budget_usdc / max_rounds.max(1) as f64);
+    let round_leg1_fraction = env::var("ROUND_LEG1_FRACTION")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v < 1.0)
+        .unwrap_or(0.45);
     let cap_unhedged_value = env::var("DRYRUN_MAX_UNHEDGED_VALUE")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -1147,10 +1223,13 @@ fn read_dryrun_params() -> DryRunParams {
         .filter(|v| v.is_finite())
         .unwrap_or(0.001);
     DryRunParams {
-        qty,
         improve_min,
         margin_target,
         safety_margin,
+        total_budget_usdc,
+        max_rounds,
+        round_budget_usdc,
+        round_leg1_fraction,
         max_unhedged_value,
         cap_unhedged_value: Some(max_unhedged_value),
         max_unhedged_shares,
@@ -2123,6 +2202,12 @@ fn build_dryrun_ledger(
         cost_up: 0.0,
         qty_down: 0.0,
         cost_down: 0.0,
+        spent_total_usdc: 0.0,
+        spent_round_usdc: 0.0,
+        round_idx: 0,
+        round_state: RoundPhase::Idle,
+        round_leg1: None,
+        round_qty_target: 0.0,
         best_bid_up: None,
         best_ask_up: None,
         best_bid_down: None,
@@ -2188,6 +2273,41 @@ impl DryRunLedger {
             }
         }
     }
+
+    fn round_state_str(&self) -> &'static str {
+        match self.round_state {
+            RoundPhase::Idle => "idle",
+            RoundPhase::Leg1Filled => "leg1_filled",
+            RoundPhase::Done => "done",
+        }
+    }
+
+    fn round_leg1_str(&self) -> Option<&'static str> {
+        match self.round_leg1 {
+            Some(TradeLeg::Up) => Some("UP"),
+            Some(TradeLeg::Down) => Some("DOWN"),
+            None => None,
+        }
+    }
+
+    fn update_round_state(&mut self, params: &DryRunParams, now_ts: u64) {
+        if self.round_state == RoundPhase::Done {
+            return;
+        }
+        let time_left_secs = if self.end_ts > now_ts {
+            self.end_ts - now_ts
+        } else {
+            0
+        };
+        if self.round_state == RoundPhase::Idle
+            && (self.round_idx >= params.max_rounds || time_left_secs <= params.tail_freeze_secs)
+        {
+            self.round_state = RoundPhase::Done;
+            self.round_leg1 = None;
+            self.round_qty_target = 0.0;
+            self.spent_round_usdc = 0.0;
+        }
+    }
 }
 
 fn should_run_dryrun(ledger: &DryRunLedger, now_ms: u64, interval_ms: u64) -> bool {
@@ -2211,6 +2331,127 @@ fn mid_price(bid: Option<f64>, ask: Option<f64>) -> Option<f64> {
 
 fn price_for_unhedged(bid: Option<f64>, ask: Option<f64>) -> Option<f64> {
     mid_price(bid, ask).or(ask).or(bid)
+}
+
+fn compute_round_qty_target(
+    price_leg1: f64,
+    price_leg2: f64,
+    round_budget_usdc: f64,
+    leg1_fraction: f64,
+) -> Option<f64> {
+    if price_leg1 <= 0.0 || price_leg2 <= 0.0 || round_budget_usdc <= 0.0 {
+        return None;
+    }
+    let leg1_budget = round_budget_usdc * leg1_fraction;
+    let mut qty = (leg1_budget / price_leg1).floor();
+    let max_pair_qty = (round_budget_usdc / (price_leg1 + price_leg2)).floor();
+    if max_pair_qty < qty {
+        qty = max_pair_qty;
+    }
+    if qty <= 0.0 {
+        return None;
+    }
+    Some(qty)
+}
+
+fn build_round_plan(ledger: &DryRunLedger, params: &DryRunParams, now_ts: u64) -> RoundPlan {
+    let time_left_secs = if ledger.end_ts > now_ts {
+        ledger.end_ts - now_ts
+    } else {
+        0
+    };
+    let abs_net = (ledger.qty_up - ledger.qty_down).abs();
+    let eps = 1e-9;
+    let budget_remaining_round = (params.round_budget_usdc - ledger.spent_round_usdc).max(0.0);
+    let budget_remaining_total = (params.total_budget_usdc - ledger.spent_total_usdc).max(0.0);
+
+    if ledger.round_state == RoundPhase::Leg1Filled {
+        return RoundPlan {
+            phase: ledger.round_state,
+            planned_leg1: ledger.round_leg1,
+            qty_target: if ledger.round_qty_target > 0.0 {
+                Some(ledger.round_qty_target)
+            } else {
+                None
+            },
+            balance_leg: None,
+            balance_qty: None,
+            can_start_new_round: false,
+            budget_remaining_round,
+            budget_remaining_total,
+            reserve_needed_usdc: None,
+        };
+    }
+
+    let can_open_round = ledger.round_state == RoundPhase::Idle
+        && ledger.round_idx < params.max_rounds
+        && time_left_secs > params.tail_freeze_secs;
+
+    if can_open_round {
+        if let (Some(price_up), Some(price_down)) = (ledger.best_bid_up, ledger.best_bid_down) {
+            let (leg1, price1, price2) = if price_up <= price_down {
+                (TradeLeg::Up, price_up, price_down)
+            } else {
+                (TradeLeg::Down, price_down, price_up)
+            };
+            let qty_target = compute_round_qty_target(
+                price1,
+                price2,
+                params.round_budget_usdc,
+                params.round_leg1_fraction,
+            );
+            let reserve_needed_usdc = match leg1 {
+                TradeLeg::Up => ledger.best_ask_down.or(ledger.best_bid_down),
+                TradeLeg::Down => ledger.best_ask_up.or(ledger.best_bid_up),
+            }
+            .and_then(|price| qty_target.map(|qty| qty * price));
+            let can_start_new_round = qty_target.is_some()
+                && budget_remaining_round > 0.0
+                && budget_remaining_total > 0.0;
+            return RoundPlan {
+                phase: RoundPhase::Idle,
+                planned_leg1: Some(leg1),
+                qty_target,
+                balance_leg: None,
+                balance_qty: None,
+                can_start_new_round,
+                budget_remaining_round,
+                budget_remaining_total,
+                reserve_needed_usdc,
+            };
+        }
+    }
+
+    if abs_net > eps {
+        let balance_leg = if ledger.qty_up > ledger.qty_down {
+            TradeLeg::Down
+        } else {
+            TradeLeg::Up
+        };
+        return RoundPlan {
+            phase: ledger.round_state,
+            planned_leg1: None,
+            qty_target: None,
+            balance_leg: Some(balance_leg),
+            balance_qty: Some(abs_net),
+            can_start_new_round: false,
+            budget_remaining_round,
+            budget_remaining_total,
+            reserve_needed_usdc: None,
+        };
+    }
+
+    RoundPlan {
+        phase: ledger.round_state,
+        planned_leg1: None,
+        qty_target: None,
+        balance_leg: None,
+        balance_qty: None,
+        can_start_new_round: false,
+        budget_remaining_round,
+        budget_remaining_total,
+        reserve_needed_usdc: None,
+    }
 }
 
 fn simulate_trade(ledger: &DryRunLedger, action: &CandidateAction) -> SimResult {
@@ -2303,12 +2544,16 @@ fn simulate_trade(ledger: &DryRunLedger, action: &CandidateAction) -> SimResult 
     let improves_hedge = new_hedgeable > ledger.hedgeable()
         || (new_unhedged_value_up + new_unhedged_value_down)
             < (current_unhedged_value_up + current_unhedged_value_down);
+    let cost_before = ledger.cost_up + ledger.cost_down;
+    let cost_after = new_cost_up + new_cost_down;
+    let spent_delta_usdc = (cost_after - cost_before).max(0.0);
 
     SimResult {
         ok,
         fill_qty,
         fill_price: fill_price_out,
         fee_estimate: 0.0,
+        spent_delta_usdc,
         new_qty_up,
         new_cost_up,
         new_qty_down,
@@ -2331,18 +2576,65 @@ fn evaluate_action_gate(
     sim: &SimResult,
     params: &DryRunParams,
     now_ts: u64,
+    round_plan: &RoundPlan,
 ) -> GateResult {
+    let budget_remaining_round = round_plan.budget_remaining_round;
+    let budget_remaining_total = round_plan.budget_remaining_total;
+    let mut reserve_needed_usdc = None;
+    if round_plan.phase == RoundPhase::Idle {
+        if let Some(planned_leg1) = round_plan.planned_leg1 {
+            if action.leg == planned_leg1 {
+                let other_price = match planned_leg1 {
+                    TradeLeg::Up => ledger.best_ask_down.or(ledger.best_bid_down),
+                    TradeLeg::Down => ledger.best_ask_up.or(ledger.best_bid_up),
+                };
+                if let Some(other_price) = other_price {
+                    reserve_needed_usdc = Some(action.qty * other_price);
+                }
+            }
+        }
+    }
+    let mk_gate = |allow: bool, deny_reason: Option<DenyReason>| GateResult {
+        allow,
+        deny_reason,
+        can_start_new_round: round_plan.can_start_new_round,
+        budget_remaining_round,
+        budget_remaining_total,
+        reserve_needed_usdc,
+    };
+
     if action.kind == TradeKind::Taker {
-        return GateResult {
-            allow: false,
-            deny_reason: Some(DenyReason::TakerDisabled),
-        };
+        return mk_gate(false, Some(DenyReason::TakerDisabled));
     }
     if !sim.ok {
-        return GateResult {
-            allow: false,
-            deny_reason: Some(DenyReason::NoQuote),
-        };
+        return mk_gate(false, Some(DenyReason::NoQuote));
+    }
+    let spent_total_after = ledger.spent_total_usdc + sim.spent_delta_usdc;
+    let spent_round_after = ledger.spent_round_usdc + sim.spent_delta_usdc;
+    if spent_total_after > params.total_budget_usdc + 1e-9 {
+        return mk_gate(false, Some(DenyReason::TotalBudgetCap));
+    }
+    if spent_round_after > params.round_budget_usdc + 1e-9 {
+        return mk_gate(false, Some(DenyReason::RoundBudgetCap));
+    }
+
+    if let Some(planned_leg1) = round_plan.planned_leg1 {
+        if round_plan.phase == RoundPhase::Idle && action.leg != planned_leg1 {
+            return mk_gate(false, Some(DenyReason::ReserveForPair));
+        }
+        if round_plan.phase == RoundPhase::Leg1Filled && action.leg == planned_leg1 {
+            return mk_gate(false, Some(DenyReason::ReserveForPair));
+        }
+        if round_plan.phase == RoundPhase::Idle && action.leg == planned_leg1 {
+            if let Some(reserve_needed) = reserve_needed_usdc {
+                if spent_round_after + reserve_needed > params.round_budget_usdc + 1e-9 {
+                    return mk_gate(false, Some(DenyReason::ReserveForPair));
+                }
+                if spent_total_after + reserve_needed > params.total_budget_usdc + 1e-9 {
+                    return mk_gate(false, Some(DenyReason::TotalBudgetCap));
+                }
+            }
+        }
     }
 
     let current_pair_cost = ledger.pair_cost();
@@ -2362,150 +2654,119 @@ fn evaluate_action_gate(
 
     if time_left_secs <= params.tail_close_secs {
         if abs_net <= eps {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::TailClose),
-            };
+            return mk_gate(false, Some(DenyReason::TailClose));
         }
         if !would_reduce_abs_net_leg {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::TailClose),
-            };
+            return mk_gate(false, Some(DenyReason::TailClose));
         }
     } else if time_left_secs <= params.tail_freeze_secs && would_increase_abs_net_leg {
-        return GateResult {
-            allow: false,
-            deny_reason: Some(DenyReason::TailFreeze),
-        };
+        return mk_gate(false, Some(DenyReason::TailFreeze));
     }
 
     if ledger.locked {
-        if abs_net <= eps && abs_sim > abs_net + eps {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::LockedKeepBalance),
-            };
+        if time_left_secs <= params.tail_freeze_secs && would_increase_abs_net_leg {
+            return mk_gate(false, Some(DenyReason::LockedTailFreeze));
         }
-        if would_increase_abs_net_leg {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::LockedNoExpand),
-            };
+        if ledger.round_state == RoundPhase::Leg1Filled {
+            if let Some(leg1) = ledger.round_leg1 {
+                if action.leg == leg1 {
+                    return mk_gate(false, Some(DenyReason::LockedWaitingPair));
+                }
+            }
+        }
+        if ledger.round_idx >= params.max_rounds && would_increase_abs_net_leg {
+            return mk_gate(false, Some(DenyReason::LockedMaxRounds));
+        }
+        if !round_plan.can_start_new_round && would_increase_abs_net_leg {
+            return mk_gate(false, Some(DenyReason::LockedPolicyHold));
         }
     }
 
     if time_left_secs < params.cooldown_secs && would_increase_abs_net_leg {
-        return GateResult {
-            allow: false,
-            deny_reason: Some(DenyReason::Cooldown),
-        };
+        return mk_gate(false, Some(DenyReason::Cooldown));
     }
 
     if sim.new_unhedged_value_up > params.max_unhedged_value
         || sim.new_unhedged_value_down > params.max_unhedged_value
     {
-        return GateResult {
-            allow: false,
-            deny_reason: Some(if sim.new_unhedged_value_up > params.max_unhedged_value {
+        return mk_gate(
+            false,
+            Some(if sim.new_unhedged_value_up > params.max_unhedged_value {
                 DenyReason::LegCapValueUp
             } else {
                 DenyReason::LegCapValueDown
             }),
-        };
+        );
     }
     if let Some(max_shares) = params.max_unhedged_shares {
         if sim.new_unhedged_up > max_shares {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::LegCapSharesUp),
-            };
+            return mk_gate(false, Some(DenyReason::LegCapSharesUp));
         }
         if sim.new_unhedged_down > max_shares {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::LegCapSharesDown),
-            };
+            return mk_gate(false, Some(DenyReason::LegCapSharesDown));
         }
     }
     if sim.new_unhedged_value_up >= params.max_unhedged_value {
-        return GateResult {
-            allow: false,
-            deny_reason: Some(DenyReason::LegCapValueUp),
-        };
+        return mk_gate(false, Some(DenyReason::LegCapValueUp));
     }
     if sim.new_unhedged_value_down >= params.max_unhedged_value {
-        return GateResult {
-            allow: false,
-            deny_reason: Some(DenyReason::LegCapValueDown),
-        };
+        return mk_gate(false, Some(DenyReason::LegCapValueDown));
     }
 
     if let Some(sim_pair_cost) = sim_pair_cost {
         if sim_pair_cost >= 1.0 - params.safety_margin {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::MarginTarget),
-            };
+            return mk_gate(false, Some(DenyReason::MarginTarget));
         }
     }
 
     if let (Some(current_pair_cost), Some(sim_pair_cost)) = (current_pair_cost, sim_pair_cost) {
         if sim_pair_cost > current_pair_cost - params.improve_min && !sim.improves_hedge {
-            return GateResult {
-                allow: false,
-                deny_reason: Some(DenyReason::NoImprove),
-            };
+            return mk_gate(false, Some(DenyReason::NoImprove));
         }
     }
 
-    GateResult {
-        allow: true,
-        deny_reason: None,
-    }
+    mk_gate(true, None)
 }
 
 fn build_dryrun_candidates(
     ledger: &DryRunLedger,
     params: &DryRunParams,
 ) -> Vec<(CandidateAction, SimResult, GateResult, Option<f64>)> {
-    let actions = vec![
-        CandidateAction {
-            name: "BUY_UP_TAKER",
-            leg: TradeLeg::Up,
-            side: TradeSide::Buy,
-            kind: TradeKind::Taker,
-            qty: params.qty,
-        },
-        CandidateAction {
-            name: "BUY_DOWN_TAKER",
-            leg: TradeLeg::Down,
-            side: TradeSide::Buy,
-            kind: TradeKind::Taker,
-            qty: params.qty,
-        },
-        CandidateAction {
+    let now_ts = Utc::now().timestamp();
+    let now_ts = u64::try_from(now_ts).unwrap_or(0);
+    let round_plan = build_round_plan(ledger, params, now_ts);
+    let qty_for_leg = |leg: TradeLeg| -> Option<f64> {
+        if let Some(balance_leg) = round_plan.balance_leg {
+            if balance_leg == leg {
+                return round_plan.balance_qty;
+            }
+            return None;
+        }
+        round_plan.qty_target
+    };
+    let mut actions = Vec::new();
+    if let Some(qty) = qty_for_leg(TradeLeg::Up) {
+        actions.push(CandidateAction {
             name: "BUY_UP_MAKER",
             leg: TradeLeg::Up,
             side: TradeSide::Buy,
             kind: TradeKind::Maker,
-            qty: params.qty,
-        },
-        CandidateAction {
+            qty,
+        });
+    }
+    if let Some(qty) = qty_for_leg(TradeLeg::Down) {
+        actions.push(CandidateAction {
             name: "BUY_DOWN_MAKER",
             leg: TradeLeg::Down,
             side: TradeSide::Buy,
             kind: TradeKind::Maker,
-            qty: params.qty,
-        },
-    ];
-
-    let now_ts = Utc::now().timestamp();
-    let now_ts = u64::try_from(now_ts).unwrap_or(0);
+            qty,
+        });
+    }
     let mut out = Vec::with_capacity(actions.len());
     for action in actions {
         let sim = simulate_trade(ledger, &action);
-        let gate = evaluate_action_gate(ledger, &action, &sim, params, now_ts);
+        let gate = evaluate_action_gate(ledger, &action, &sim, params, now_ts, &round_plan);
         let score = if gate.allow {
             let mut base = sim
                 .new_pair_cost
@@ -2534,6 +2795,7 @@ fn log_dryrun_snapshot(
     }
     let now_ts = Utc::now().timestamp();
     let now_ts = u64::try_from(now_ts).unwrap_or(0);
+    let round_plan = build_round_plan(ledger, params, now_ts);
     let time_left_secs = if ledger.end_ts > now_ts {
         ledger.end_ts - now_ts
     } else {
@@ -2608,6 +2870,60 @@ fn log_dryrun_snapshot(
     data.insert(
         "tail_mode".to_string(),
         Value::String(tail_mode.to_string()),
+    );
+    data.insert(
+        "can_start_new_round".to_string(),
+        Value::Bool(round_plan.can_start_new_round),
+    );
+    data.insert(
+        "budget_remaining_round".to_string(),
+        Value::from(round_plan.budget_remaining_round),
+    );
+    data.insert(
+        "budget_remaining_total".to_string(),
+        Value::from(round_plan.budget_remaining_total),
+    );
+    data.insert(
+        "reserve_needed_usdc".to_string(),
+        round_plan
+            .reserve_needed_usdc
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    data.insert(
+        "spent_total_usdc".to_string(),
+        Value::from(ledger.spent_total_usdc),
+    );
+    data.insert(
+        "spent_round_usdc".to_string(),
+        Value::from(ledger.spent_round_usdc),
+    );
+    data.insert(
+        "round_idx".to_string(),
+        Value::Number(serde_json::Number::from(ledger.round_idx)),
+    );
+    data.insert(
+        "round_state".to_string(),
+        Value::String(ledger.round_state_str().to_string()),
+    );
+    data.insert(
+        "round_leg1".to_string(),
+        ledger
+            .round_leg1_str()
+            .map(|value| Value::String(value.to_string()))
+            .unwrap_or(Value::Null),
+    );
+    data.insert(
+        "round_qty_target".to_string(),
+        Value::from(ledger.round_qty_target),
+    );
+    data.insert(
+        "total_budget_usdc".to_string(),
+        Value::from(params.total_budget_usdc),
+    );
+    data.insert(
+        "round_budget_usdc".to_string(),
+        Value::from(params.round_budget_usdc),
     );
     data.insert("locked".to_string(), Value::Bool(ledger.locked));
     data.insert(
@@ -2832,6 +3148,22 @@ fn candidate_to_value(
         "sim_unhedged_value_down".to_string(),
         Value::from(sim.new_unhedged_value_down),
     );
+    data.insert(
+        "can_start_new_round".to_string(),
+        Value::Bool(gate.can_start_new_round),
+    );
+    data.insert(
+        "budget_remaining_round".to_string(),
+        Value::from(gate.budget_remaining_round),
+    );
+    data.insert(
+        "budget_remaining_total".to_string(),
+        Value::from(gate.budget_remaining_total),
+    );
+    data.insert(
+        "reserve_needed_usdc".to_string(),
+        gate.reserve_needed_usdc.map(Value::from).unwrap_or(Value::Null),
+    );
     let cap_value = params.max_unhedged_value;
     data.insert(
         "would_violate_cap_value_up".to_string(),
@@ -2884,14 +3216,19 @@ fn deny_reason_to_str(value: DenyReason) -> &'static str {
         DenyReason::NoImprove => "no_improve",
         DenyReason::Cooldown => "cooldown",
         DenyReason::NoQuote => "no_quote",
+        DenyReason::TotalBudgetCap => "total_budget_cap",
+        DenyReason::RoundBudgetCap => "round_budget_cap",
+        DenyReason::ReserveForPair => "reserve_for_pair",
         DenyReason::LegCapValueUp => "leg_cap_value_up",
         DenyReason::LegCapValueDown => "leg_cap_value_down",
         DenyReason::LegCapSharesUp => "leg_cap_shares_up",
         DenyReason::LegCapSharesDown => "leg_cap_shares_down",
         DenyReason::TailFreeze => "tail_freeze",
         DenyReason::TailClose => "tail_close",
-        DenyReason::LockedNoExpand => "locked_no_expand",
-        DenyReason::LockedKeepBalance => "locked_keep_balance",
+        DenyReason::LockedMaxRounds => "locked_max_rounds",
+        DenyReason::LockedTailFreeze => "locked_tail_freeze",
+        DenyReason::LockedWaitingPair => "locked_waiting_pair",
+        DenyReason::LockedPolicyHold => "locked_policy_hold",
     }
 }
 
@@ -2946,7 +3283,13 @@ fn log_dryrun_apply(
     log_jsonl(log_ctx, "dryrun_apply", data);
 }
 
-fn apply_simulated_trade(ledger: &mut DryRunLedger, sim: &SimResult) {
+fn apply_simulated_trade(
+    ledger: &mut DryRunLedger,
+    action: &CandidateAction,
+    sim: &SimResult,
+    params: &DryRunParams,
+    now_ts: u64,
+) {
     if !sim.ok {
         return;
     }
@@ -2954,6 +3297,47 @@ fn apply_simulated_trade(ledger: &mut DryRunLedger, sim: &SimResult) {
     ledger.cost_up = sim.new_cost_up;
     ledger.qty_down = sim.new_qty_down;
     ledger.cost_down = sim.new_cost_down;
+    if sim.spent_delta_usdc > 0.0 {
+        ledger.spent_total_usdc += sim.spent_delta_usdc;
+        ledger.spent_round_usdc += sim.spent_delta_usdc;
+    }
+
+    let time_left_secs = if ledger.end_ts > now_ts {
+        ledger.end_ts - now_ts
+    } else {
+        0
+    };
+    let eps = 1e-9;
+    match ledger.round_state {
+        RoundPhase::Idle => {
+            if time_left_secs > params.tail_freeze_secs
+                && ledger.round_idx < params.max_rounds
+                && action.side == TradeSide::Buy
+            {
+                ledger.round_state = RoundPhase::Leg1Filled;
+                ledger.round_leg1 = Some(action.leg);
+                ledger.round_qty_target = action.qty;
+            }
+        }
+        RoundPhase::Leg1Filled => {
+            if let Some(leg1) = ledger.round_leg1 {
+                let balanced = (sim.new_qty_up - sim.new_qty_down).abs() <= eps;
+                if action.leg != leg1 && balanced {
+                    ledger.round_idx = ledger.round_idx.saturating_add(1);
+                    ledger.round_leg1 = None;
+                    ledger.round_qty_target = 0.0;
+                    ledger.spent_round_usdc = 0.0;
+                    if ledger.round_idx >= params.max_rounds || time_left_secs <= params.tail_freeze_secs
+                    {
+                        ledger.round_state = RoundPhase::Done;
+                    } else {
+                        ledger.round_state = RoundPhase::Idle;
+                    }
+                }
+            }
+        }
+        RoundPhase::Done => {}
+    }
 }
 
 fn hash_ids(ids: &[String]) -> String {

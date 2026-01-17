@@ -14,6 +14,9 @@ async fn main() -> Result<()> {
 
     let config = config::Config::from_env()?;
     println!("host={}, funder={}", config.clob_host, config.funder);
+    if let Some(budget) = config.total_budget_usdc {
+        println!("total_budget_usdc={}", budget);
+    }
     println!("boot ok");
     ws_market::run(&config).await?;
     Ok(())
