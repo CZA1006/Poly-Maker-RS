@@ -341,6 +341,8 @@ pub async fn run(config: &Config) -> Result<()> {
         tracing::info!(series_slug = ?series_slug, "using series_slug");
     }
     let mut backoff_secs = 1u64;
+    let series_slug_value = series_slug.clone().unwrap_or_default();
+    let mut dryrun: Option<DryRunLedger> = None;
 
     loop {
         let (selection, initial_gamma_stats) = if let Some(ref slug) = market_slug {
@@ -379,10 +381,52 @@ pub async fn run(config: &Config) -> Result<()> {
             )
         };
         let allow_rollover = market_slug.is_none() && series_slug.is_some();
+        let selection_slug = selection.market_slug.clone().unwrap_or_default();
+
+        match dryrun.as_ref() {
+            Some(ledger) if ledger.market_slug == selection_slug => {
+                tracing::info!(
+                    market_slug = %ledger.market_slug,
+                    round_idx = ledger.round_idx,
+                    qty_up = ledger.qty_up,
+                    qty_down = ledger.qty_down,
+                    spent_total_usdc = ledger.spent_total_usdc,
+                    "dryrun_reused"
+                );
+            }
+            Some(ledger) => {
+                tracing::info!(
+                    old_slug = %ledger.market_slug,
+                    new_slug = %selection_slug,
+                    reason = "market_slug_changed",
+                    "dryrun_reset"
+                );
+                dryrun = Some(build_dryrun_ledger(
+                    &series_slug_value,
+                    &selection,
+                    &market_select_mode,
+                ));
+            }
+            None => {
+                tracing::info!(
+                    new_slug = %selection_slug,
+                    reason = "init",
+                    "dryrun_reset"
+                );
+                dryrun = Some(build_dryrun_ledger(
+                    &series_slug_value,
+                    &selection,
+                    &market_select_mode,
+                ));
+            }
+        }
 
         let attempt = connect_and_run(
             &ws_url,
             &selection,
+            dryrun
+                .as_mut()
+                .expect("dryrun ledger should be initialized"),
             initial_gamma_stats,
             if allow_rollover {
                 series_slug.as_deref()
@@ -415,6 +459,7 @@ pub async fn run(config: &Config) -> Result<()> {
 async fn connect_and_run(
     ws_url: &str,
     selection: &AssetSelection,
+    dryrun: &mut DryRunLedger,
     initial_gamma_stats: Option<gamma::GammaPickStats>,
     series_slug: Option<&str>,
     refresh_on_empty: bool,
@@ -484,7 +529,6 @@ async fn connect_and_run(
     let series_slug = series_slug.map(str::to_string);
     let has_series_slug = series_slug.is_some();
     let series_slug_value = series_slug.clone().unwrap_or_default();
-    let mut dryrun = build_dryrun_ledger(&series_slug_value, &current_selection, &market_select_mode);
     let gamma_log_throttle_ms = read_gamma_log_throttle_ms();
     let mut gamma_pick_throttle = GammaLogThrottle::default();
     let mut gamma_fastpath_throttle = GammaLogThrottle::default();
@@ -570,7 +614,7 @@ async fn connect_and_run(
                         if applied.gate.allow && applied.sim.ok {
                             log_dryrun_apply(&dryrun, &applied, &dryrun_params, &log_ctx);
                             apply_simulated_trade(
-                                &mut dryrun,
+                                dryrun,
                                 &applied.action,
                                 &applied.sim,
                                 &dryrun_params,
@@ -805,7 +849,7 @@ async fn connect_and_run(
                                     Value::from(cleared_cost_down),
                                 );
                                 log_jsonl(&log_ctx, "dryrun_reset", reset_data);
-                                dryrun = build_dryrun_ledger(
+                                *dryrun = build_dryrun_ledger(
                                     &series_slug_value,
                                     &current_selection,
                                     &market_select_mode,
@@ -891,7 +935,7 @@ async fn connect_and_run(
                             &mut cache,
                             &mut price_change_stats,
                             &mut update_stats,
-                            &mut dryrun,
+                            dryrun,
                             &mut awaiting_first_packet,
                             &series_slug_value,
                             rollover_log_json,
@@ -2611,10 +2655,16 @@ fn evaluate_action_gate(
     }
     let spent_total_after = ledger.spent_total_usdc + sim.spent_delta_usdc;
     let spent_round_after = ledger.spent_round_usdc + sim.spent_delta_usdc;
+    let current_net = ledger.qty_up - ledger.qty_down;
+    let sim_net = sim.new_qty_up - sim.new_qty_down;
+    let abs_net = current_net.abs();
+    let abs_sim = sim_net.abs();
+    let eps = 1e-9;
+    let is_reducing_risk = abs_sim + eps < abs_net;
     if spent_total_after > params.total_budget_usdc + 1e-9 {
         return mk_gate(false, Some(DenyReason::TotalBudgetCap));
     }
-    if spent_round_after > params.round_budget_usdc + 1e-9 {
+    if spent_round_after > params.round_budget_usdc + 1e-9 && !is_reducing_risk {
         return mk_gate(false, Some(DenyReason::RoundBudgetCap));
     }
 
@@ -2644,11 +2694,6 @@ fn evaluate_action_gate(
     } else {
         0
     };
-    let current_net = ledger.qty_up - ledger.qty_down;
-    let sim_net = sim.new_qty_up - sim.new_qty_down;
-    let abs_net = current_net.abs();
-    let abs_sim = sim_net.abs();
-    let eps = 1e-9;
     let would_increase_abs_net_leg = abs_sim > abs_net + eps;
     let would_reduce_abs_net_leg = abs_sim + eps < abs_net;
 

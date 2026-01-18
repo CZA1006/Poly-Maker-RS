@@ -13,15 +13,25 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Summarize a run JSONL into markdown, csv, and optional png."
     )
-    parser.add_argument("jsonl_path", help="Path to logs/<run_id>_<mode>.jsonl")
+    parser.add_argument(
+        "jsonl_path",
+        help="Path to logs/<run_id>_<mode>.jsonl or <symbol>_<window_ts>_<mode>.jsonl",
+    )
     return parser.parse_args()
 
 
 def parse_run_id_mode(path: Path):
     m = re.match(r"^(?P<run>\d{8}_\d{6})_(?P<mode>[^.]+)\.jsonl$", path.name)
-    if not m:
-        return "run", "unknown"
-    return m.group("run"), m.group("mode")
+    if m:
+        return m.group("run"), m.group("mode")
+    m = re.match(
+        r"^(?P<symbol>[a-z0-9]+)_(?P<ts>\d{10})_(?P<mode>[^.]+)\.jsonl$",
+        path.name,
+    )
+    if m:
+        return f"{m.group('symbol')}_{m.group('ts')}", m.group("mode")
+    print(f"warning: unrecognized jsonl filename: {path.name}", file=sys.stderr)
+    return "run", "unknown"
 
 
 def safe_float(value):

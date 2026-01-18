@@ -44,11 +44,11 @@ fi
 
 warn_on_legacy_series_slug
 
-mkdir -p logs
-RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 MODE="recommend"
 
-LOG_DIR="${REPO_ROOT}/logs"
+LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs}"
+mkdir -p "${LOG_DIR}"
 FULL_LOG="${LOG_DIR}/${RUN_ID}_${MODE}_full.log"
 JSONL_LOG="${LOG_DIR}/${RUN_ID}_${MODE}.jsonl"
 EXTRACTOR="${LOG_DIR}/extract_jsonl.py"
@@ -79,15 +79,85 @@ for line in sys.stdin:
     print(s)
 PY
 
-set -m
-
 PIPE_PID=""
 RUN_PGID=""
 STOPPED=0
 IN_STAGE2=0
 
+children_of_pid() {
+  ps -ax -o pid=,ppid= | awk -v p="$1" '$2==p {print $1}'
+}
+
+descendants_of_pid() {
+  local root="$1"
+  local queue="$root"
+  local seen=" $root "
+  local out=""
+
+  while [[ -n "$queue" ]]; do
+    local pid="${queue%% *}"
+    if [[ "$queue" == *" "* ]]; then
+      queue="${queue#* }"
+    else
+      queue=""
+    fi
+    for child in $(children_of_pid "$pid"); do
+      if [[ "$seen" != *" $child "* ]]; then
+        seen+=" $child "
+        out+="$child "
+        if [[ -n "$queue" ]]; then
+          queue+=" $child"
+        else
+          queue="$child"
+        fi
+      fi
+    done
+  done
+
+  echo "$out"
+}
+
+find_poly_maker_pid_from_wrapper() {
+  local root="$1"
+  for pid in $(descendants_of_pid "$root"); do
+    local cmd
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$cmd" == *"poly_maker/target/debug/poly_maker"* ]]; then
+      echo "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+refresh_run_pgid() {
+  if [[ -z "${PIPE_PID:-}" ]]; then
+    return 1
+  fi
+  local poly_pid
+  poly_pid="$(find_poly_maker_pid_from_wrapper "$PIPE_PID")"
+  if [[ -n "$poly_pid" ]]; then
+    RUN_PGID="$(ps -o pgid= -p "$poly_pid" | tr -d ' ')"
+    echo "INFO: resolved poly_pid=${poly_pid} run_pgid=${RUN_PGID}" >&2
+    return 0
+  fi
+  return 1
+}
+
 start_stage1_bg() {
-  ( cargo run --manifest-path poly_maker/Cargo.toml 2>&1 | tee "${FULL_LOG}" ) &
+  local cmd
+  cmd="cargo run --manifest-path poly_maker/Cargo.toml 2>&1 | tee \"${FULL_LOG}\""
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c "${cmd}" &
+  else
+    python3 - "${cmd}" <<'PY' &
+import os, sys
+os.setsid()
+os.execvp("bash", ["bash", "-c", sys.argv[1]])
+PY
+  fi
+
   PIPE_PID=$!
   RUN_PGID="$(ps -o pgid= -p "${PIPE_PID}" | tr -d ' ')"
   echo "INFO: stage1 started PIPE_PID=${PIPE_PID} PGID=${RUN_PGID}" >&2
@@ -109,17 +179,22 @@ stop_group() {
   fi
   STOPPED=1
 
+  refresh_run_pgid || true
   echo "INFO: stopping (PIPE_PID=${PIPE_PID:-} PGID=${RUN_PGID:-}) ..." >&2
 
   if [[ -n "${RUN_PGID:-}" ]]; then
     kill -TERM -"${RUN_PGID}" >/dev/null 2>&1 || true
-    sleep 0.8
+    for _ in $(seq 1 20); do
+      if ! kill -0 -"${RUN_PGID}" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 0.1
+    done
     kill -KILL -"${RUN_PGID}" >/dev/null 2>&1 || true
   fi
 
+  echo "WARNING: fallback pkill may kill other runs" >&2
   pkill -TERM -f "poly_maker/target/debug/poly_maker" >/dev/null 2>&1 || true
-  pkill -TERM -f "tee .*_recommend_full\.log" >/dev/null 2>&1 || true
-  sleep 0.2
   pkill -KILL -f "poly_maker/target/debug/poly_maker" >/dev/null 2>&1 || true
 }
 
@@ -130,7 +205,8 @@ cleanup() {
   stop_group
 }
 
-trap 'stop_group' INT TERM
+trap 'stop_group; exit 130' INT
+trap 'stop_group; exit 143' TERM
 trap 'cleanup' EXIT
 
 echo "INFO: running. Ctrl+C to stop. If RUN_SECS is set, script will stop automatically and then extract JSONL." >&2
