@@ -172,6 +172,150 @@ flowchart LR
 
 ---
 
+## [S03A] 微观结构派生因子（精确公式）
+
+本节解释 planner 高频使用因子的来源。  
+结论先说：这些字段不是 PM API 直接给出的，而是我们在运行时本地计算并写入 snapshot。
+
+### 3A.1 原始市场字段 vs 本地派生因子
+
+PM feed 原始输入包括：
+
+- `best_bid_*`, `best_ask_*`
+- 顶档 size
+- `exchange_ts_ms`
+
+运行时本地派生并维护：
+
+- `bid_consumption_rate_up`, `bid_consumption_rate_down`
+- `mid_up_momentum_bps`, `mid_down_momentum_bps`
+- `mid_up_discount_bps`, `mid_down_discount_bps`
+- `pair_mid_vol_bps`
+
+主代码路径：
+
+- 盘口更新与 rate 更新：`poly_maker/src/ws_market.rs:2890`
+- consumption 估计器：`poly_maker/src/ws_market.rs:3055`
+- mid/discount/momentum/vol 更新：`poly_maker/src/ws_market.rs:3727`
+
+### 3A.2 Mid 与动量（bps）
+
+`bps` 是基点（basis points）：`1 bps = 0.01% = 0.0001`。
+
+每条腿：
+
+```text
+mid = (best_bid + best_ask) / 2
+momentum_bps_t = ((mid_t - mid_{t-1}) / mid_{t-1}) * 10000
+```
+
+解释：
+
+- momentum 为正：mid 在上涨
+- momentum 为负：mid 在下跌
+
+### 3A.3 相对慢 EMA 的折价（bps）
+
+运行时对每条腿的 mid 维护快/慢 EMA：
+
+```text
+ema_t = alpha * sample_t + (1 - alpha) * ema_{t-1}
+alpha = 2 / (lookback_ticks + 1)
+```
+
+折价字段使用慢 EMA：
+
+```text
+discount_bps = ((slow_ema - mid) / slow_ema) * 10000
+```
+
+解释：
+
+- discount 为正：当前 mid 低于慢均线（“折价”）
+- discount 为负：当前 mid 高于慢均线
+
+### 3A.4 买一消费速率（shares/sec 代理）
+
+`estimate_consumption_rate` 有两种观测路径：
+
+1. 同价位队列被吃（size 下降）：
+
+```text
+observed = (old_size - new_size) / dt_secs          # 仅当 old_size > new_size
+```
+
+2. 价格移动导致 depletion（对 bid 是 best bid 下跳）：
+
+```text
+observed = (queue_size * DEPTH_PRICE_MOVE_DEPLETION_RATIO) / dt_secs
+DEPTH_PRICE_MOVE_DEPLETION_RATIO = 0.0025
+```
+
+再做 EWMA 平滑与截断：
+
+```text
+rate_t = alpha * observed + (1 - alpha) * rate_{t-1}   (alpha=0.35)
+rate_t = clamp(rate_t, 0, 20)
+```
+
+常量：
+
+- `DEPTH_CONSUMPTION_EWMA_ALPHA = 0.35`
+- `DEPTH_MIN_DT_SECS = 0.05`
+- `DEPTH_PRICE_MOVE_MAX_OBSERVED_PER_SEC = 20.0`
+
+所以 `bid_consumption_rate_up = 20.0` 的含义是：该时刻估计值触发了上限截断。
+
+### 3A.5 Pair 波动因子
+
+每个 tick：
+
+```text
+ret_up_bps = abs(mid_up_t - mid_up_{t-1}) / mid_up_{t-1} * 10000
+ret_down_bps = abs(mid_down_t - mid_down_{t-1}) / mid_down_{t-1} * 10000
+inst_vol_bps = 0.5 * (ret_up_bps + ret_down_bps)
+pair_mid_vol_bps_t = alpha * inst_vol_bps + (1 - alpha) * pair_mid_vol_bps_{t-1}
+alpha = 2 / (VOL_ENTRY_LOOKBACK_TICKS + 1)
+```
+
+该值是 planner 的波动 regime 输入。
+
+### 3A.6 基线窗实例代入（`1771676100`）
+
+在 `ts_ms=1771676123989`：
+
+- `best_bid_up=0.65`, `best_ask_up=0.67` -> `mid_up=0.66`
+- 前一帧 `mid_up=0.665`
+- `best_bid_down=0.33`, `best_ask_down=0.35` -> `mid_down=0.34`
+- 前一帧 `mid_down=0.335`
+
+动量：
+
+```text
+mid_up_momentum_bps   = (0.66 - 0.665) / 0.665 * 10000 = -75.19
+mid_down_momentum_bps = (0.34 - 0.335) / 0.335 * 10000 = +149.25
+```
+
+同一时刻慢 EMA 折价：
+
+- `slow_up ~= 0.6591418`, `slow_down ~= 0.3408582`
+
+```text
+mid_up_discount_bps   = (0.6591418 - 0.66) / 0.6591418 * 10000 = -13.02
+mid_down_discount_bps = (0.3408582 - 0.34) / 0.3408582 * 10000 = +25.18
+```
+
+与 JSONL 中观测值逐项一致：
+
+- `mid_down_discount_bps=25.18`
+- `mid_down_momentum_bps=149.25`
+- `mid_up_discount_bps=-13.02`
+- `mid_up_momentum_bps=-75.19`
+- `bid_consumption_rate_down=1.26055`
+- `bid_consumption_rate_up=20.0`
+
+---
+
 ## [S04] 决策循环（每个 tick 做什么）
 
 每个决策 tick（`DRYRUN_DECISION_EVERY_MS`）执行：
@@ -285,6 +429,38 @@ can_start_new_round =
 
 snapshot 里的 `round_plan_can_start_block_reason` 会给出主阻断原因（如 `fillability`、`phase_not_idle`、`directional_gate`、`late_new_round` 等）。
 
+### directional / reversal / turn gate 细节
+
+planner 的方向 gate（按腿）：
+
+```text
+reversal_ok_for_leg =
+    (discount_bps >= REVERSAL_MIN_DISCOUNT_BPS)
+    AND (momentum_bps >= REVERSAL_MIN_MOMENTUM_BPS)
+```
+
+turn 确认（启用时）：
+
+```text
+turn_ok_for_leg =
+    (discount_bps >= ENTRY_TURN_MIN_REBOUND_BPS)
+    AND (momentum_bps >= ENTRY_TURN_MIN_REBOUND_BPS / ENTRY_TURN_CONFIRM_TICKS)
+```
+
+当前代码默认阈值（`params.rs`）：
+
+- `REVERSAL_MIN_DISCOUNT_BPS = 6.0`
+- `REVERSAL_MIN_MOMENTUM_BPS = 2.0`
+- `ENTRY_TURN_MIN_REBOUND_BPS = 8.0`
+- `ENTRY_TURN_CONFIRM_TICKS = 4`
+
+在 `ts_ms=1771676123989`：
+
+- DOWN 腿：`discount=25.18`, `momentum=149.25` -> reversal 明确通过。
+- UP 腿：`discount=-13.02`, `momentum=-75.19` -> reversal 不通过。
+
+因此 planner 的方向倾向是由这些因子和阈值确定性计算出来的，不是随机行为。
+
 ---
 
 ## [S07] Maker 报价与成交概率模型
@@ -312,6 +488,56 @@ passive_gap_ticks = passive_gap_abs / tick
 ```
 
 若 `final_price` 不合法（太小或非有限值），该候选不可执行。
+
+### 7.1A 为什么上涨信号里也可能挂到更低价
+
+一个常见疑问是：“DOWN 明显是上涨/反转信号，为什么盘口 `0.33/0.35` 时还挂 `0.32`？”
+
+核心原因是：报价不仅由方向信号决定，还要满足**硬 no-risk 可补腿约束**。
+
+基线窗 `ts_ms=1771676123990`（`dryrun_candidates`）：
+
+- 盘口：`best_bid_down=0.33`, `best_ask_down=0.35`
+- 对侧 ask：`best_ask_up=0.67`
+- 计算结果：
+  - `entry_quote_base_postonly_price=0.34`
+  - `entry_quote_dynamic_cap_price=0.32`
+  - `entry_quote_final_price=0.32`
+
+代入基线参数（`run_multi_paper_safe.py`）：
+
+- `NO_RISK_HARD_PAIR_CAP = 0.995`
+- `ENTRY_DYNAMIC_CAP_HEADROOM_BPS = 5`  -> `0.0005`
+- `ENTRY_TARGET_MARGIN_MIN_TICKS = 0.3` 且 `tick=0.01` -> `0.003`
+- `ENTRY_TARGET_MARGIN_MIN_BPS = 5` -> 在 `opp_ask=0.67` 上是 `0.000335`
+- 所以 `target_margin = max(0.003, 0.000335) = 0.003`
+
+得到：
+
+```text
+cap_raw = 0.995 - 0.0005 - 0.67 - 0.003 = 0.3215
+cap_floor_to_tick = 0.32
+final_price = min(base_postonly=0.34, cap=0.32) = 0.32
+```
+
+同一条候选还给出：
+
+- `required_opp_avg_price_cap = 0.675`
+- `current_opp_best_ask = 0.67`
+- `hedge_recoverable_now = true`
+- `hedge_margin_ok = true`
+- `open_margin_surplus ~= 0`（几乎贴线）
+
+这表示该报价已经接近“可安全补腿”的边界。  
+若把第一腿抬到 `0.33/0.34`，该边界会被压低到对侧 ask 之下，进而触发硬 no-risk 拒绝。
+
+解释：
+
+1. 方向信号告诉我们优先开 DOWN 第一腿。
+2. no-risk 动态上限告诉我们“只能在 <=0.32 的价格开”。
+3. 因此机器人用 maker 等待回踩/流动性消耗到该价位。
+
+这不是策略“看错方向”，而是策略把 no-risk 可补腿优先级放在成交速度之前。
 
 ### 7.2 成交概率（`maker_fill_prob`）
 
@@ -397,6 +623,55 @@ open_margin_surplus = hedge_margin_to_opp_ask - hedge_margin_required
 
 当策略已达到安全进度时，lock 会阻止继续扩大净风险。
 对应关键 deny reason 为 `locked_strict_abs_net`。
+
+### 8.5 no-risk 是“多层防线”，不是单点开关
+
+no-risk 不是某一个 if 条件，而是跨 planner/simulate/gate/runtime 的防线链路：
+
+```text
+第1层（Planner 预筛）
+    projected_pair_cost / entry_worst_pair_cost / entry_edge_bps
+    先过滤掉不可补或边际过薄的开仓
+
+第2层（Simulate 精算）
+    dynamic_cap 报价
+    hedge_recoverable_now
+    hedge_margin_ok
+    open_margin_surplus
+
+第3层（Gate 硬拒绝）
+    强制 hard_pair_cap <= 0.995
+    强制 recoverability + margin + open_margin 下限
+    强制预算 / reserve / tail / lock 规则
+
+第4层（运行时 resting 复检）
+    挂单后仍持续基于最新盘口重算
+    一旦不可恢复或 pair-cap 恶化，立即撤单
+    仅在有明显进展时才延长 timeout
+
+第5层（状态机收口纪律）
+    lock 防止安全后再次扩风险
+    tail_close 只允许降低 abs_net 的动作
+```
+
+对应代码：
+
+- planner 可行性：`strategy/planner.rs`（`entry_worst_pair_ok`, `entry_edge_bps`, `can_start_new_round`）
+- 报价与可恢复性：`strategy/simulate.rs`
+- 硬拒绝顺序：`strategy/gate.rs`
+- 挂单期风险复检与撤单/延时：`ws_market.rs`
+- round/tail/lock 状态迁移：`strategy/state.rs`
+
+### 8.6 “no-risk”在本系统里的精确定义
+
+这里的 no-risk 指：
+
+1. 每个“增加风险敞口”的动作，在决策时必须满足硬 no-risk 条件；
+2. 挂单期间持续复检，条件破坏则撤单修复；
+3. 尾盘阶段以净敞口收口为优先目标。
+
+它并不意味着“知道未来所有盘口路径”的绝对保证。  
+它意味着在可观测盘口 + 最坏补腿模型假设下，严格约束并快速纠偏。
 
 ---
 
