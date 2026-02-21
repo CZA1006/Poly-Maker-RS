@@ -157,10 +157,7 @@ const CACHE_TTL_MS: i64 = 2500;
 
 pub fn take_last_pick_stats() -> GammaPickStats {
     let stats = LAST_PICK_STATS.get_or_init(|| Mutex::new(GammaPickStats::default()));
-    stats
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default()
+    stats.lock().map(|guard| guard.clone()).unwrap_or_default()
 }
 
 fn update_last_pick_stats(stats: &GammaPickStats) {
@@ -197,7 +194,10 @@ pub async fn fetch_fixed_market_info_by_slug(market_slug: &str) -> Result<FixedM
         bail!("gamma response status {}", response.status());
     }
 
-    let body = response.text().await.context("failed to read gamma response")?;
+    let body = response
+        .text()
+        .await
+        .context("failed to read gamma response")?;
     let value: serde_json::Value = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(err) => {
@@ -287,7 +287,10 @@ pub async fn pick_latest_open_market_by_series(series_slug: &str) -> Result<Sele
             bail!("gamma response status {}", response.status());
         }
 
-        let body = response.text().await.context("failed to read gamma response")?;
+        let body = response
+            .text()
+            .await
+            .context("failed to read gamma response")?;
         let value: serde_json::Value = match serde_json::from_str(&body) {
             Ok(value) => value,
             Err(err) => {
@@ -868,7 +871,9 @@ fn top_level_kind(value: &serde_json::Value) -> &'static str {
     "other"
 }
 
-fn markets_array_from_value<'a>(value: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Value>> {
+fn markets_array_from_value<'a>(
+    value: &'a serde_json::Value,
+) -> Option<&'a Vec<serde_json::Value>> {
     if let Some(items) = value.as_array() {
         return Some(items);
     }
@@ -1242,9 +1247,16 @@ fn resolve_up_down_tokens(
     bail!("missing outcome labels for up/down mapping")
 }
 
-fn map_by_labels(labels: &[String], tokens: &[TokenCandidate]) -> Result<(String, String, &'static str)> {
+fn map_by_labels(
+    labels: &[String],
+    tokens: &[TokenCandidate],
+) -> Result<(String, String, &'static str)> {
     if labels.len() != tokens.len() {
-        bail!("outcome labels count mismatch: {} vs {}", labels.len(), tokens.len());
+        bail!(
+            "outcome labels count mismatch: {} vs {}",
+            labels.len(),
+            tokens.len()
+        );
     }
     let mut up_idx = None;
     let mut down_idx = None;
@@ -1267,11 +1279,9 @@ fn map_by_labels(labels: &[String], tokens: &[TokenCandidate]) -> Result<(String
         }
     }
     match (up_idx, down_idx) {
-        (Some(up), Some(down)) if up != down => Ok((
-            tokens[up].id.clone(),
-            tokens[down].id.clone(),
-            mode,
-        )),
+        (Some(up), Some(down)) if up != down => {
+            Ok((tokens[up].id.clone(), tokens[down].id.clone(), mode))
+        }
         _ => bail!("outcomes do not include Up/Down"),
     }
 }

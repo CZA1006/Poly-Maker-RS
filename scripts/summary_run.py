@@ -3,7 +3,9 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -16,6 +18,16 @@ def parse_args():
     parser.add_argument(
         "jsonl_path",
         help="Path to logs/<run_id>_<mode>.jsonl or <symbol>_<window_ts>_<mode>.jsonl",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Generate PNG summary plot (disabled by default).",
+    )
+    parser.add_argument(
+        "--story-plot",
+        action="store_true",
+        help="Generate reference-style multi-panel story plot and companion CSV/MD outputs.",
     )
     return parser.parse_args()
 
@@ -155,9 +167,31 @@ def main():
                         "spent_total_usdc",
                         "spent_round_usdc",
                         "round_idx",
+                        "effective_max_rounds",
                         "round_state",
+                        "round_done_reason",
                         "round_leg1",
                         "round_qty_target",
+                        "round_leg1_target_qty",
+                        "round_leg1_filled_qty",
+                        "round_leg2_target_qty",
+                        "round_leg2_filled_qty",
+                        "best_bid_up",
+                        "best_ask_up",
+                        "best_bid_down",
+                        "best_ask_down",
+                        "round_plan_entry_worst_pair_ok",
+                        "round_plan_pair_quality_ok",
+                        "round_plan_pair_regression_ok",
+                        "round_plan_can_open_round_base_ok",
+                        "round_plan_entry_timeout_flow_ok",
+                        "round_plan_entry_fillability_ok",
+                        "round_plan_entry_edge_bps",
+                        "round_plan_can_start_block_reason",
+                        "round_plan_entry_regime_score",
+                        "round_plan_slice_count_planned",
+                        "round_plan_slice_qty_current",
+                        "first_leg_turning_score",
                     ]:
                         if key not in decision:
                             decision[key] = last_snapshot.get(key)
@@ -170,6 +204,30 @@ def main():
             decision["best_action_leg"] = best_action.get("leg") if best_action else None
             decision["best_action_fill_price"] = best_action.get("fill_price") if best_action else None
             decision["best_action_qty"] = best_action.get("qty") if best_action else None
+            decision["best_action_entry_quote_base_postonly_price"] = (
+                best_action.get("entry_quote_base_postonly_price") if best_action else None
+            )
+            decision["best_action_entry_quote_dynamic_cap_price"] = (
+                best_action.get("entry_quote_dynamic_cap_price") if best_action else None
+            )
+            decision["best_action_entry_quote_final_price"] = (
+                best_action.get("entry_quote_final_price") if best_action else None
+            )
+            decision["best_action_entry_quote_cap_active"] = (
+                best_action.get("entry_quote_cap_active") if best_action else None
+            )
+            decision["best_action_entry_quote_cap_bind"] = (
+                best_action.get("entry_quote_cap_bind") if best_action else None
+            )
+            decision["best_action_hedge_margin_to_opp_ask"] = (
+                best_action.get("hedge_margin_to_opp_ask") if best_action else None
+            )
+            decision["best_action_hedge_margin_required"] = (
+                best_action.get("hedge_margin_required") if best_action else None
+            )
+            decision["best_action_hedge_margin_ok"] = (
+                best_action.get("hedge_margin_ok") if best_action else None
+            )
 
             applied_action = data.get("applied_action") if isinstance(data.get("applied_action"), dict) else None
             decision["applied_action_action"] = applied_action.get("action") if applied_action else None
@@ -177,6 +235,30 @@ def main():
             decision["applied_action_leg"] = applied_action.get("leg") if applied_action else None
             decision["applied_action_fill_price"] = applied_action.get("fill_price") if applied_action else None
             decision["applied_action_qty"] = applied_action.get("qty") if applied_action else None
+            decision["applied_action_entry_quote_base_postonly_price"] = (
+                applied_action.get("entry_quote_base_postonly_price") if applied_action else None
+            )
+            decision["applied_action_entry_quote_dynamic_cap_price"] = (
+                applied_action.get("entry_quote_dynamic_cap_price") if applied_action else None
+            )
+            decision["applied_action_entry_quote_final_price"] = (
+                applied_action.get("entry_quote_final_price") if applied_action else None
+            )
+            decision["applied_action_entry_quote_cap_active"] = (
+                applied_action.get("entry_quote_cap_active") if applied_action else None
+            )
+            decision["applied_action_entry_quote_cap_bind"] = (
+                applied_action.get("entry_quote_cap_bind") if applied_action else None
+            )
+            decision["applied_action_hedge_margin_to_opp_ask"] = (
+                applied_action.get("hedge_margin_to_opp_ask") if applied_action else None
+            )
+            decision["applied_action_hedge_margin_required"] = (
+                applied_action.get("hedge_margin_required") if applied_action else None
+            )
+            decision["applied_action_hedge_margin_ok"] = (
+                applied_action.get("hedge_margin_ok") if applied_action else None
+            )
 
             allow_count = 0
             deny_count = 0
@@ -221,6 +303,30 @@ def main():
                 decision["applied_action_leg"] = applied_action.get("leg") if applied_action else None
                 decision["applied_action_fill_price"] = applied_action.get("fill_price") if applied_action else None
                 decision["applied_action_qty"] = applied_action.get("qty") if applied_action else None
+                decision["applied_action_entry_quote_base_postonly_price"] = (
+                    applied_action.get("entry_quote_base_postonly_price") if applied_action else None
+                )
+                decision["applied_action_entry_quote_dynamic_cap_price"] = (
+                    applied_action.get("entry_quote_dynamic_cap_price") if applied_action else None
+                )
+                decision["applied_action_entry_quote_final_price"] = (
+                    applied_action.get("entry_quote_final_price") if applied_action else None
+                )
+                decision["applied_action_entry_quote_cap_active"] = (
+                    applied_action.get("entry_quote_cap_active") if applied_action else None
+                )
+                decision["applied_action_entry_quote_cap_bind"] = (
+                    applied_action.get("entry_quote_cap_bind") if applied_action else None
+                )
+                decision["applied_action_hedge_margin_to_opp_ask"] = (
+                    applied_action.get("hedge_margin_to_opp_ask") if applied_action else None
+                )
+                decision["applied_action_hedge_margin_required"] = (
+                    applied_action.get("hedge_margin_required") if applied_action else None
+                )
+                decision["applied_action_hedge_margin_ok"] = (
+                    applied_action.get("hedge_margin_ok") if applied_action else None
+                )
 
     for decision in decisions.values():
         pair_cost = decision.get("pair_cost")
@@ -256,16 +362,36 @@ def main():
                 decision.get("round_state"),
                 decision.get("round_leg1"),
                 decision.get("round_qty_target"),
+                decision.get("round_leg1_target_qty"),
+                decision.get("round_leg1_filled_qty"),
+                decision.get("round_leg2_target_qty"),
+                decision.get("round_leg2_filled_qty"),
                 decision.get("best_action_action"),
                 decision.get("best_action_kind"),
                 decision.get("best_action_leg"),
                 decision.get("best_action_fill_price"),
                 decision.get("best_action_qty"),
+                decision.get("best_action_entry_quote_base_postonly_price"),
+                decision.get("best_action_entry_quote_dynamic_cap_price"),
+                decision.get("best_action_entry_quote_final_price"),
+                decision.get("best_action_entry_quote_cap_active"),
+                decision.get("best_action_entry_quote_cap_bind"),
+                decision.get("best_action_hedge_margin_to_opp_ask"),
+                decision.get("best_action_hedge_margin_required"),
+                decision.get("best_action_hedge_margin_ok"),
                 decision.get("applied_action_action"),
                 decision.get("applied_action_kind"),
                 decision.get("applied_action_leg"),
                 decision.get("applied_action_fill_price"),
                 decision.get("applied_action_qty"),
+                decision.get("applied_action_entry_quote_base_postonly_price"),
+                decision.get("applied_action_entry_quote_dynamic_cap_price"),
+                decision.get("applied_action_entry_quote_final_price"),
+                decision.get("applied_action_entry_quote_cap_active"),
+                decision.get("applied_action_entry_quote_cap_bind"),
+                decision.get("applied_action_hedge_margin_to_opp_ask"),
+                decision.get("applied_action_hedge_margin_required"),
+                decision.get("applied_action_hedge_margin_ok"),
                 decision.get("apply_reason"),
                 decision.get("allow_count"),
                 decision.get("deny_count"),
@@ -298,16 +424,36 @@ def main():
                 "round_state",
                 "round_leg1",
                 "round_qty_target",
+                "round_leg1_target_qty",
+                "round_leg1_filled_qty",
+                "round_leg2_target_qty",
+                "round_leg2_filled_qty",
                 "best_action_action",
                 "best_action_kind",
                 "best_action_leg",
                 "best_action_fill_price",
                 "best_action_qty",
+                "best_action_entry_quote_base_postonly_price",
+                "best_action_entry_quote_dynamic_cap_price",
+                "best_action_entry_quote_final_price",
+                "best_action_entry_quote_cap_active",
+                "best_action_entry_quote_cap_bind",
+                "best_action_hedge_margin_to_opp_ask",
+                "best_action_hedge_margin_required",
+                "best_action_hedge_margin_ok",
                 "applied_action_action",
                 "applied_action_kind",
                 "applied_action_leg",
                 "applied_action_fill_price",
                 "applied_action_qty",
+                "applied_action_entry_quote_base_postonly_price",
+                "applied_action_entry_quote_dynamic_cap_price",
+                "applied_action_entry_quote_final_price",
+                "applied_action_entry_quote_cap_active",
+                "applied_action_entry_quote_cap_bind",
+                "applied_action_hedge_margin_to_opp_ask",
+                "applied_action_hedge_margin_required",
+                "applied_action_hedge_margin_ok",
                 "apply_reason",
                 "allow_count",
                 "deny_count",
@@ -343,8 +489,31 @@ def main():
                 snap.get("spent_total_usdc"),
                 snap.get("spent_round_usdc"),
                 snap.get("round_idx"),
+                snap.get("effective_max_rounds"),
                 snap.get("round_state"),
+                snap.get("round_done_reason"),
                 snap.get("round_leg1"),
+                snap.get("round_qty_target"),
+                snap.get("round_leg1_target_qty"),
+                snap.get("round_leg1_filled_qty"),
+                snap.get("round_leg2_target_qty"),
+                snap.get("round_leg2_filled_qty"),
+                snap.get("best_bid_up"),
+                snap.get("best_ask_up"),
+                snap.get("best_bid_down"),
+                snap.get("best_ask_down"),
+                snap.get("round_plan_entry_worst_pair_ok"),
+                snap.get("round_plan_pair_quality_ok"),
+                snap.get("round_plan_pair_regression_ok"),
+                snap.get("round_plan_can_open_round_base_ok"),
+                snap.get("round_plan_entry_timeout_flow_ok"),
+                snap.get("round_plan_entry_fillability_ok"),
+                snap.get("round_plan_entry_edge_bps"),
+                snap.get("round_plan_can_start_block_reason"),
+                snap.get("round_plan_entry_regime_score"),
+                snap.get("round_plan_slice_count_planned"),
+                snap.get("round_plan_slice_qty_current"),
+                snap.get("first_leg_turning_score"),
             ]
         )
 
@@ -364,46 +533,70 @@ def main():
                 "spent_total_usdc",
                 "spent_round_usdc",
                 "round_idx",
+                "effective_max_rounds",
                 "round_state",
+                "round_done_reason",
                 "round_leg1",
+                "round_qty_target",
+                "round_leg1_target_qty",
+                "round_leg1_filled_qty",
+                "round_leg2_target_qty",
+                "round_leg2_filled_qty",
+                "best_bid_up",
+                "best_ask_up",
+                "best_bid_down",
+                "best_ask_down",
+                "round_plan_entry_worst_pair_ok",
+                "round_plan_pair_quality_ok",
+                "round_plan_pair_regression_ok",
+                "round_plan_can_open_round_base_ok",
+                "round_plan_entry_timeout_flow_ok",
+                "round_plan_entry_fillability_ok",
+                "round_plan_entry_edge_bps",
+                "round_plan_can_start_block_reason",
+                "round_plan_entry_regime_score",
+                "round_plan_slice_count_planned",
+                "round_plan_slice_qty_current",
+                "first_leg_turning_score",
             ]
         )
         writer.writerows(timeseries_rows)
 
     # Optional plot
-    try:
-        import matplotlib.pyplot as plt  # type: ignore
+    if args.plot:
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
 
-        if timeseries_rows:
-            ts0 = timeseries_rows[0][0] or 0
-            xs = [((row[0] or ts0) - ts0) / 1000.0 for row in timeseries_rows]
-            pair_costs = [
-                safe_float(row[3]) if safe_float(row[3]) is not None else math.nan
-                for row in timeseries_rows
-            ]
-            hedgeable = [safe_float(row[4]) for row in timeseries_rows]
-            unhedged_up = [safe_float(row[5]) for row in timeseries_rows]
-            unhedged_down = [safe_float(row[6]) for row in timeseries_rows]
+            if timeseries_rows:
+                ts0 = timeseries_rows[0][0] or 0
+                xs = [((row[0] or ts0) - ts0) / 1000.0 for row in timeseries_rows]
+                pair_costs = [
+                    safe_float(row[3]) if safe_float(row[3]) is not None else math.nan
+                    for row in timeseries_rows
+                ]
+                hedgeable = [safe_float(row[4]) for row in timeseries_rows]
+                unhedged_up = [safe_float(row[5]) for row in timeseries_rows]
+                unhedged_down = [safe_float(row[6]) for row in timeseries_rows]
 
-            fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-            axes[0].plot(xs, pair_costs, label="pair_cost")
-            axes[0].set_ylabel("pair_cost")
-            axes[0].legend()
+                fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+                axes[0].plot(xs, pair_costs, label="pair_cost")
+                axes[0].set_ylabel("pair_cost")
+                axes[0].legend()
 
-            axes[1].plot(xs, hedgeable, label="hedgeable")
-            axes[1].plot(xs, unhedged_up, label="unhedged_value_up")
-            axes[1].plot(xs, unhedged_down, label="unhedged_value_down")
-            axes[1].set_xlabel("time (s)")
-            axes[1].legend()
+                axes[1].plot(xs, hedgeable, label="hedgeable")
+                axes[1].plot(xs, unhedged_up, label="unhedged_value_up")
+                axes[1].plot(xs, unhedged_down, label="unhedged_value_down")
+                axes[1].set_xlabel("time (s)")
+                axes[1].legend()
 
-            fig.tight_layout()
-            fig.savefig(summary_png)
-            plt.close(fig)
-    except Exception as exc:
-        print(
-            f"INFO: matplotlib not available or plotting failed: {exc}. Skipping PNG.",
-            file=sys.stderr,
-        )
+                fig.tight_layout()
+                fig.savefig(summary_png)
+                plt.close(fig)
+        except Exception as exc:
+            print(
+                f"INFO: matplotlib not available or plotting failed: {exc}. Skipping PNG.",
+                file=sys.stderr,
+            )
 
     deny_rows = []
     total_denies = sum(deny_counts.values())
@@ -459,6 +652,28 @@ def main():
         summary_lines.append(f"- {reason}: {count}")
 
     summary_md.write_text("\n".join(summary_lines))
+
+    if args.story_plot:
+        story_script = Path(__file__).with_name("plot_window_story.py")
+        if story_script.exists():
+            try:
+                env = dict(os.environ)
+                env.setdefault("MPLBACKEND", "Agg")
+                subprocess.run(
+                    [sys.executable, str(story_script), str(input_path)],
+                    check=True,
+                    env=env,
+                )
+            except Exception as exc:
+                print(
+                    f"INFO: story plot generation failed: {exc}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"INFO: story plot script not found: {story_script}",
+                file=sys.stderr,
+            )
 
     print(f"wrote: {summary_md}")
     print(f"wrote: {decisions_csv}")

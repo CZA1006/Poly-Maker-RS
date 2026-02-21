@@ -256,4 +256,13 @@ if [[ ! -s "${JSONL_LOG}" ]]; then
   exit 1
 fi
 
-./scripts/check_run.sh "${JSONL_LOG}"
+RUN_CHECK_ON_EXIT="${RUN_CHECK_ON_EXIT:-1}"
+RUN_CHECK_ON_EXIT_LC="$(printf '%s' "${RUN_CHECK_ON_EXIT}" | tr '[:upper:]' '[:lower:]')"
+case "${RUN_CHECK_ON_EXIT_LC}" in
+  0|false|no)
+    echo "INFO: skip check_run on exit (RUN_CHECK_ON_EXIT=${RUN_CHECK_ON_EXIT})" >&2
+    ;;
+  *)
+    ./scripts/check_run.sh "${JSONL_LOG}"
+    ;;
+esac

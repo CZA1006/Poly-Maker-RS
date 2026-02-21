@@ -6,7 +6,12 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
+
+DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
+DEFAULT_WS_HOST = "wss://ws-subscriptions-clob.polymarket.com"
+DEFAULT_WS_PATH = "/ws/market"
+DEFAULT_GAMMA_HOST = "https://gamma-api.polymarket.com"
 
 
 def parse_args():
@@ -43,19 +48,65 @@ def parse_args():
         help="Max attempts per market (0 = infinite)",
     )
     parser.add_argument(
+        "--wait-until-window-start",
+        dest="wait_until_window_start",
+        action="store_true",
+        default=True,
+        help="Wait until selected 15m window start timestamp before running (default: true)",
+    )
+    parser.add_argument(
+        "--no-wait-until-window-start",
+        dest="wait_until_window_start",
+        action="store_false",
+        help="Start immediately after slug validation without waiting for window start",
+    )
+    parser.add_argument(
         "--parallelism",
         type=int,
         default=0,
         help="Parallelism limit (default: number of symbols)",
     )
-    parser.add_argument("--total-budget", type=float, default=10.0)
-    parser.add_argument("--max-rounds", type=int, default=2)
+    parser.add_argument(
+        "--global-total-budget",
+        type=float,
+        default=10.0,
+        help="Global total budget across all symbols (default: 10.0)",
+    )
+    parser.add_argument(
+        "--per-market-budget-cap",
+        type=float,
+        default=0.0,
+        help="Optional hard cap per market budget (0 = disabled)",
+    )
+    parser.add_argument(
+        "--budget-strategy",
+        choices=["equal", "weighted"],
+        default="equal",
+        help="Budget allocation strategy across symbols (default: equal)",
+    )
+    parser.add_argument(
+        "--symbol-weights",
+        default="",
+        help="Comma-separated weights, e.g. btc=3,eth=2,sol=1,xrp=1 (used when budget-strategy=weighted)",
+    )
+    parser.add_argument(
+        "--total-budget",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--max-rounds", type=int, default=6)
     parser.add_argument("--round-budget", type=float, default=0.0)
     parser.add_argument("--round-leg1-fraction", type=float, default=0.45)
     parser.add_argument("--tail-freeze-secs", type=int, default=300)
     parser.add_argument("--tail-close-secs", type=int, default=180)
     parser.add_argument("--decision-every-ms", type=int, default=200)
-    parser.add_argument("--run-secs", type=int, default=900)
+    parser.add_argument(
+        "--run-secs",
+        type=int,
+        default=900,
+        help="Max runtime seconds per window (actual runtime is clamped to window end)",
+    )
     parser.add_argument("--gamma-host", default=os.environ.get("GAMMA_HOST", ""))
     return parser.parse_args()
 
@@ -78,6 +129,15 @@ def market_slug(symbol: str, t: int) -> str:
     return f"{symbol}-updown-15m-{t}"
 
 
+def resolve_window_run_secs(configured_run_secs: int, window_start_ts: int) -> int:
+    now_ts = int(time.time())
+    remaining_to_window_end = (window_start_ts + 900) - now_ts
+    remaining_to_window_end = max(1, remaining_to_window_end)
+    if configured_run_secs <= 0:
+        return remaining_to_window_end
+    return max(1, min(configured_run_secs, remaining_to_window_end))
+
+
 async def run_validate(slug: str, gamma_host: str) -> Tuple[bool, str]:
     cmd = [sys.executable, "scripts/validate_market_slug.py", slug]
     if gamma_host:
@@ -94,17 +154,115 @@ async def run_validate(slug: str, gamma_host: str) -> Tuple[bool, str]:
     return ok, text
 
 
-def build_env(args: argparse.Namespace, slug: str, symbol: str, t: int, log_dir: Path) -> dict:
+def parse_symbol_weights(raw: str, symbols: List[str]) -> Dict[str, float]:
+    weights = {sym: 1.0 for sym in symbols}
+    if not raw.strip():
+        return weights
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(f"invalid symbol weight item: {item}")
+        key, value = item.split("=", 1)
+        symbol = key.strip().lower()
+        if symbol not in weights:
+            raise SystemExit(f"unknown symbol in --symbol-weights: {symbol}")
+        try:
+            weight = float(value.strip())
+        except Exception as exc:
+            raise SystemExit(f"invalid weight for {symbol}: {value}") from exc
+        if not (weight > 0 and weight < float("inf")):
+            raise SystemExit(f"invalid non-positive weight for {symbol}: {value}")
+        weights[symbol] = weight
+    return weights
+
+
+def resolve_global_total_budget(args: argparse.Namespace) -> float:
+    budget = args.global_total_budget
+    if args.total_budget is not None:
+        if abs(args.global_total_budget - 10.0) < 1e-9:
+            budget = args.total_budget
+            print(
+                "WARN: --total-budget is deprecated; use --global-total-budget",
+                flush=True,
+            )
+        elif abs(args.total_budget - args.global_total_budget) > 1e-9:
+            print(
+                "WARN: both --total-budget and --global-total-budget set; using --global-total-budget",
+                flush=True,
+            )
+    if not (budget > 0 and budget < float("inf")):
+        raise SystemExit(f"invalid global budget: {budget}")
+    return budget
+
+
+def allocate_market_budgets(
+    symbols: List[str], args: argparse.Namespace, global_total_budget: float
+) -> Dict[str, float]:
+    per_market_cap = args.per_market_budget_cap
+    if per_market_cap < 0:
+        raise SystemExit("--per-market-budget-cap must be >= 0")
+
+    if args.budget_strategy == "equal":
+        raw = {sym: global_total_budget / max(1, len(symbols)) for sym in symbols}
+    else:
+        weights = parse_symbol_weights(args.symbol_weights, symbols)
+        total_weight = sum(weights.values())
+        if total_weight <= 0:
+            raise SystemExit("sum of symbol weights must be > 0")
+        raw = {
+            sym: global_total_budget * (weights[sym] / total_weight) for sym in symbols
+        }
+
+    if per_market_cap > 0:
+        return {sym: min(value, per_market_cap) for sym, value in raw.items()}
+    return raw
+
+
+def build_env(
+    args: argparse.Namespace,
+    slug: str,
+    symbol: str,
+    t: int,
+    log_dir: Path,
+    market_budget: float,
+    global_total_budget: float,
+    run_secs: int,
+) -> dict:
     env = os.environ.copy()
-    env["RUN_SECS"] = str(args.run_secs)
+    # This runner is intentionally paper-only.
+    env["EXECUTION_MODE"] = "paper"
+    env["EXECUTION_ADAPTER"] = "paper"
+    env["LIVE_MODE"] = "false"
+    env["USER_WS_ENABLED"] = "false"
+    env["SIM_FILL"] = "false"
+    env.setdefault("CLOB_HOST", DEFAULT_CLOB_HOST)
+    env.setdefault("WS_HOST", DEFAULT_WS_HOST)
+    env.setdefault("WS_PATH", DEFAULT_WS_PATH)
+    env.setdefault("GAMMA_HOST", args.gamma_host or DEFAULT_GAMMA_HOST)
+    # Paper mode should not require real credentials.
+    env.setdefault("PK", "paper_dummy_pk")
+    env.setdefault("CLOB_API_KEY", "paper_dummy_key")
+    env.setdefault("CLOB_API_SECRET", "paper_dummy_secret")
+    env.setdefault("CLOB_API_PASSPHRASE", "paper_dummy_passphrase")
+    env.setdefault("FUNDER", "paper_dummy_funder")
+    env.setdefault("CHAIN_ID", "137")
+    env["RUN_SECS"] = str(run_secs)
+    # Multi-window orchestration should hand off quickly between adjacent windows.
+    # Run validation checks after the batch instead of blocking the next window here.
+    env["RUN_CHECK_ON_EXIT"] = "0"
     env["DRYRUN_MODE"] = "paper"
     env["ALLOW_TAKER"] = "false"
-    env["TOTAL_BUDGET_USDC"] = str(args.total_budget)
+    env["TOTAL_BUDGET_USDC"] = str(market_budget)
+    env["GLOBAL_TOTAL_BUDGET_USDC"] = str(global_total_budget)
+    env["MARKET_BUDGET_USDC"] = str(market_budget)
+    env["MULTI_BUDGET_STRATEGY"] = str(args.budget_strategy)
     env["MAX_ROUNDS"] = str(args.max_rounds)
     if args.round_budget > 0:
-        env["ROUND_BUDGET_USDC"] = str(args.round_budget)
+        env["ROUND_BUDGET_USDC"] = str(min(args.round_budget, market_budget))
     else:
-        env["ROUND_BUDGET_USDC"] = str(args.total_budget / max(1, args.max_rounds))
+        env["ROUND_BUDGET_USDC"] = str(market_budget / max(1, args.max_rounds))
     env["ROUND_LEG1_FRACTION"] = str(args.round_leg1_fraction)
     env["DRYRUN_TAIL_FREEZE_SECS"] = str(args.tail_freeze_secs)
     env["DRYRUN_TAIL_CLOSE_SECS"] = str(args.tail_close_secs)
@@ -112,6 +270,56 @@ def build_env(args: argparse.Namespace, slug: str, symbol: str, t: int, log_dir:
     env["MARKET_SLUG"] = slug
     env["RUN_ID"] = f"{symbol}_{t}"
     env["LOG_DIR"] = str(log_dir)
+    env["NO_RISK_PAIR_LIMIT_MODE"] = "hard_cap_only"
+    env["ENTRY_PAIR_REGRESSION_MODE"] = "cap_edge"
+    env["ENTRY_PAIR_REGRESSION_SOFT_BAND_BPS"] = "40"
+    env["NO_RISK_ENTRY_HEDGE_PRICE_MODE"] = "ask"
+    env["NO_RISK_HARD_PAIR_CAP"] = "0.995"
+    env["ENTRY_DYNAMIC_CAP_HEADROOM_BPS"] = "5"
+    env["ENTRY_TARGET_MARGIN_MIN_TICKS"] = "0.3"
+    env["ENTRY_TARGET_MARGIN_MIN_BPS"] = "5"
+    env["ENTRY_MAX_PASSIVE_TICKS_FOR_NET_INCREASE"] = "1.5"
+    env["OPEN_MIN_FILL_PROB"] = "0.06"
+    env["HEDGE_RECOVERABILITY_MARGIN_ENFORCE"] = "true"
+    env["HEDGE_RECOVERABILITY_MARGIN_MIN_TICKS"] = "0.5"
+    env["HEDGE_RECOVERABILITY_MARGIN_MIN_BPS"] = "8"
+    env["HEDGE_RECOVERABILITY_MARGIN_APPLY_TO_NET_INCREASE_ONLY"] = "true"
+    env["NO_RISK_HEDGE_RECOVERABILITY_ENFORCE"] = "true"
+    env["NO_RISK_HEDGE_RECOVERABILITY_EPS_BPS"] = "2"
+    env["OPEN_ORDER_UNRECOVERABLE_GRACE_MS"] = "2500"
+    env["MAKER_FILL_PASSIVE_QUEUE_PENALTY_PER_TICK"] = "1.25"
+    env["MAKER_FILL_PASSIVE_DECAY_K"] = "0.35"
+    env["ENTRY_PASSIVE_GAP_SOFT_MAX_TICKS"] = "3.0"
+    env["ROUND_DYNAMIC_SLICING_ENABLED"] = "true"
+    env["ROUND_MIN_SLICES"] = "3"
+    env["ROUND_MAX_SLICES"] = "10"
+    env["ENTRY_MAX_TOP_BOOK_SHARE"] = "0.35"
+    env["ENTRY_MAX_FLOW_UTILIZATION"] = "0.75"
+    env["MAKER_FILL_HORIZON_SECS"] = "12"
+    env["ENTRY_EDGE_MIN_BPS"] = "20"
+    env["ENTRY_FILL_PROB_MIN"] = "0.05"
+    env["MAKER_MIN_FILL_PROB"] = "0.05"
+    # Avoid early strict lock right after the first completed pair so later rounds
+    # can continue under hard no-risk constraints.
+    env["LOCK_MIN_COMPLETED_ROUNDS"] = "5"
+    env["LOCK_MIN_SPENT_RATIO"] = "0.55"
+    env["LOCK_FORCE_TIME_LEFT_SECS"] = str(max(0, args.tail_close_secs))
+    env["LOCK_ALLOW_REOPEN_BEFORE_FREEZE"] = "true"
+    env["LOCK_REOPEN_MAX_ROUNDS"] = str(max(1, args.max_rounds - 1))
+    env["NO_RISK_LATE_NEW_ROUND_BUFFER_SECS"] = "0"
+    env["PAPER_MIN_REQUOTE_INTERVAL_MS"] = "5000"
+    env["PAPER_REQUOTE_PRICE_DELTA_TICKS"] = "3"
+    env["PAPER_REQUOTE_STALE_MS_HARD"] = "25000"
+    env["REQUOTE_MIN_FILL_PROB_UPLIFT"] = "0.015"
+    env["REQUOTE_QUEUE_STICKINESS_RATIO"] = "4.0"
+    env["REQUOTE_STICKINESS_MIN_AGE_SECS"] = "20"
+    env["OPEN_ORDER_MAX_AGE_SECS"] = "90"
+    env["PAPER_ORDER_TIMEOUT_SECS"] = "18"
+    env["PAPER_TIMEOUT_TARGET_FILL_PROB"] = "0.60"
+    env["PAPER_TIMEOUT_PROGRESS_EXTEND_MIN"] = "0.50"
+    env["PAPER_TIMEOUT_PROGRESS_EXTEND_SECS"] = "12"
+    env["PAPER_TIMEOUT_MAX_EXTENDS"] = "1"
+    env["OPEN_MARGIN_SURPLUS_MIN"] = "0.0005"
     return env
 
 
@@ -162,9 +370,34 @@ async def run_paper(env: dict, run_state: RunState, stop_event: asyncio.Event) -
         await run_state.unregister(proc)
 
 
+async def wait_until_window_start(
+    symbol: str,
+    slug: str,
+    window_start_ts: int,
+    stop_event: asyncio.Event,
+) -> bool:
+    """Return False if stop was requested before window start."""
+    wait_secs = window_start_ts - int(time.time())
+    if wait_secs <= 0:
+        return True
+    print(
+        f"[{symbol}] waiting {wait_secs}s until window start ts={window_start_ts} slug={slug}",
+        flush=True,
+    )
+    deadline = time.time() + wait_secs
+    while not stop_event.is_set():
+        remain = deadline - time.time()
+        if remain <= 0:
+            return True
+        await asyncio.sleep(min(1.0, remain))
+    return False
+
+
 async def worker(
     symbol: str,
     args: argparse.Namespace,
+    market_budget: float,
+    global_total_budget: float,
     sem: asyncio.Semaphore,
     stop_event: asyncio.Event,
     run_state: RunState,
@@ -194,10 +427,87 @@ async def worker(
 
         log_dir = repo_root() / "logs" / "multi" / symbol / str(t)
         log_dir.mkdir(parents=True, exist_ok=True)
-        env = build_env(args, slug, symbol, t, log_dir)
+        if args.wait_until_window_start:
+            if not await wait_until_window_start(symbol, slug, t, stop_event):
+                return
+        window_run_secs = resolve_window_run_secs(args.run_secs, t)
+        window_end_ts = t + 900
+        now_ts = int(time.time())
+        remaining_to_window_end = max(0, window_end_ts - now_ts)
+        print(
+            (
+                f"[{symbol}] window timing slug={slug} now_ts={now_ts} "
+                f"window_end_ts={window_end_ts} remaining_to_end={remaining_to_window_end}s "
+                f"run_secs={window_run_secs}"
+            ),
+            flush=True,
+        )
+        env = build_env(
+            args,
+            slug,
+            symbol,
+            t,
+            log_dir,
+            market_budget=market_budget,
+            global_total_budget=global_total_budget,
+            run_secs=window_run_secs,
+        )
 
         async with sem:
-            print(f"[{symbol}] run window slug={slug} log_dir={log_dir}", flush=True)
+            print(
+                f"[{symbol}] run window slug={slug} budget={market_budget:.4f} log_dir={log_dir}",
+                flush=True,
+            )
+            print(
+                (
+                    f"[{symbol}] risk_params pair_limit_mode={env.get('NO_RISK_PAIR_LIMIT_MODE')} "
+                    f"pair_regression_mode={env.get('ENTRY_PAIR_REGRESSION_MODE')} "
+                    f"pair_regression_soft_band_bps={env.get('ENTRY_PAIR_REGRESSION_SOFT_BAND_BPS')} "
+                    f"entry_hedge_mode={env.get('NO_RISK_ENTRY_HEDGE_PRICE_MODE')} "
+                    f"hard_cap={env.get('NO_RISK_HARD_PAIR_CAP')} "
+                    f"max_rounds={env.get('MAX_ROUNDS')} "
+                    f"entry_dynamic_cap_headroom_bps={env.get('ENTRY_DYNAMIC_CAP_HEADROOM_BPS')} "
+                    f"entry_target_margin_min_ticks={env.get('ENTRY_TARGET_MARGIN_MIN_TICKS')} "
+                    f"entry_target_margin_min_bps={env.get('ENTRY_TARGET_MARGIN_MIN_BPS')} "
+                    f"entry_max_passive_ticks={env.get('ENTRY_MAX_PASSIVE_TICKS_FOR_NET_INCREASE')} "
+                    f"open_min_fill_prob={env.get('OPEN_MIN_FILL_PROB')} "
+                    f"margin_enforce={env.get('HEDGE_RECOVERABILITY_MARGIN_ENFORCE')} "
+                    f"margin_min_ticks={env.get('HEDGE_RECOVERABILITY_MARGIN_MIN_TICKS')} "
+                    f"margin_min_bps={env.get('HEDGE_RECOVERABILITY_MARGIN_MIN_BPS')} "
+                    f"recoverability_enforce={env.get('NO_RISK_HEDGE_RECOVERABILITY_ENFORCE')} "
+                    f"unrecoverable_grace_ms={env.get('OPEN_ORDER_UNRECOVERABLE_GRACE_MS')} "
+                    f"passive_penalty_per_tick={env.get('MAKER_FILL_PASSIVE_QUEUE_PENALTY_PER_TICK')} "
+                    f"passive_decay_k={env.get('MAKER_FILL_PASSIVE_DECAY_K')} "
+                    f"passive_gap_soft_max_ticks={env.get('ENTRY_PASSIVE_GAP_SOFT_MAX_TICKS')} "
+                    f"dynamic_slicing={env.get('ROUND_DYNAMIC_SLICING_ENABLED')} "
+                    f"slice_range=[{env.get('ROUND_MIN_SLICES')},{env.get('ROUND_MAX_SLICES')}] "
+                    f"entry_top_share={env.get('ENTRY_MAX_TOP_BOOK_SHARE')} "
+                    f"entry_flow_util={env.get('ENTRY_MAX_FLOW_UTILIZATION')} "
+                    f"entry_edge_min_bps={env.get('ENTRY_EDGE_MIN_BPS')} "
+                    f"entry_fill_prob_min={env.get('ENTRY_FILL_PROB_MIN')} "
+                    f"maker_min_fill_prob={env.get('MAKER_MIN_FILL_PROB')} "
+                    f"maker_fill_horizon_secs={env.get('MAKER_FILL_HORIZON_SECS')} "
+                    f"lock_min_completed_rounds={env.get('LOCK_MIN_COMPLETED_ROUNDS')} "
+                    f"lock_min_spent_ratio={env.get('LOCK_MIN_SPENT_RATIO')} "
+                    f"lock_force_time_left_secs={env.get('LOCK_FORCE_TIME_LEFT_SECS')} "
+                    f"lock_allow_reopen_before_freeze={env.get('LOCK_ALLOW_REOPEN_BEFORE_FREEZE')} "
+                    f"lock_reopen_max_rounds={env.get('LOCK_REOPEN_MAX_ROUNDS')} "
+                    f"paper_min_requote_interval_ms={env.get('PAPER_MIN_REQUOTE_INTERVAL_MS')} "
+                    f"paper_requote_price_delta_ticks={env.get('PAPER_REQUOTE_PRICE_DELTA_TICKS')} "
+                    f"paper_requote_stale_ms_hard={env.get('PAPER_REQUOTE_STALE_MS_HARD')} "
+                    f"requote_min_fill_prob_uplift={env.get('REQUOTE_MIN_FILL_PROB_UPLIFT')} "
+                    f"requote_queue_stickiness_ratio={env.get('REQUOTE_QUEUE_STICKINESS_RATIO')} "
+                    f"requote_stickiness_min_age_secs={env.get('REQUOTE_STICKINESS_MIN_AGE_SECS')} "
+                    f"open_order_max_age_secs={env.get('OPEN_ORDER_MAX_AGE_SECS')} "
+                    f"paper_order_timeout_secs={env.get('PAPER_ORDER_TIMEOUT_SECS')} "
+                    f"paper_timeout_target_fill_prob={env.get('PAPER_TIMEOUT_TARGET_FILL_PROB')} "
+                    f"paper_timeout_progress_extend_min={env.get('PAPER_TIMEOUT_PROGRESS_EXTEND_MIN')} "
+                    f"paper_timeout_progress_extend_secs={env.get('PAPER_TIMEOUT_PROGRESS_EXTEND_SECS')} "
+                    f"paper_timeout_max_extends={env.get('PAPER_TIMEOUT_MAX_EXTENDS')} "
+                    f"open_margin_surplus_min={env.get('OPEN_MARGIN_SURPLUS_MIN')}"
+                ),
+                flush=True,
+            )
             code = await run_paper(env, run_state, stop_event)
         if code != 0:
             raise RuntimeError(f"run_paper failed slug={slug} code={code}")
@@ -208,9 +518,25 @@ async def worker(
 
 async def main_async():
     args = parse_args()
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if not args.gamma_host:
+        args.gamma_host = os.environ.get("GAMMA_HOST", DEFAULT_GAMMA_HOST)
+    symbols = [s.strip().lower() for s in args.symbols.split(",") if s.strip()]
     if not symbols:
         raise SystemExit("no symbols provided")
+    global_total_budget = resolve_global_total_budget(args)
+    market_budgets = allocate_market_budgets(symbols, args, global_total_budget)
+    total_assigned = sum(market_budgets.values())
+    print(
+        (
+            f"budget_config strategy={args.budget_strategy} "
+            f"global_total_budget={global_total_budget:.4f} "
+            f"per_market_cap={args.per_market_budget_cap:.4f} "
+            f"total_assigned={total_assigned:.4f}"
+        ),
+        flush=True,
+    )
+    for sym in symbols:
+        print(f"[{sym}] market_budget={market_budgets[sym]:.4f}", flush=True)
 
     parallelism = args.parallelism or len(symbols)
     sem = asyncio.Semaphore(max(1, parallelism))
@@ -234,7 +560,17 @@ async def main_async():
         loop.add_signal_handler(sig, _handle_signal)
 
     tasks = [
-        asyncio.create_task(worker(sym, args, sem, stop_event, run_state))
+        asyncio.create_task(
+            worker(
+                sym,
+                args,
+                market_budgets[sym],
+                global_total_budget,
+                sem,
+                stop_event,
+                run_state,
+            )
+        )
         for sym in symbols
     ]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)

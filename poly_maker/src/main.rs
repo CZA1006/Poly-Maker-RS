@@ -2,7 +2,9 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod execution;
 mod gamma;
+mod strategy;
 mod ws_market;
 
 #[tokio::main]
@@ -17,6 +19,14 @@ async fn main() -> Result<()> {
     if let Some(budget) = config.total_budget_usdc {
         println!("total_budget_usdc={}", budget);
     }
+    println!(
+        "live_mode={}, execution_mode={}, execution_adapter={}, user_ws_enabled={}, settlement_enabled={}",
+        config.live_mode,
+        config.execution_mode,
+        config.execution_adapter,
+        config.user_ws_enabled,
+        config.settlement_enabled
+    );
     println!("boot ok");
     ws_market::run(&config).await?;
     Ok(())
