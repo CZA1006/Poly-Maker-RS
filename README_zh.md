@@ -18,7 +18,7 @@ Language: [English](README.md) | [中文](README_zh.md)
 本项目本质上是在做一个带硬约束的优化问题：
 
 $$
-\max \mathbb{E}[\mathrm{window\_pnl}]
+\max \mathbb{E}[P_{\mathrm{window}}]
 $$
 
 纯文本：`maximize E[window_pnl]`。
@@ -26,7 +26,7 @@ $$
 但必须满足以下硬约束：
 
 $$
-\mathrm{仅\ Maker},\ \mathrm{executed\_pair\_cost} \le 0.995,\ \mathrm{final\_abs\_net}=0,\ \mathrm{unmatched\_loss}=0
+\text{仅 Maker},\ \text{pair-cost} \le 0.995,\ \text{final abs net}=0,\ \text{unmatched loss}=0
 $$
 
 纯文本：`仅 Maker，executed_pair_cost <= 0.995，final_abs_net = 0，unmatched_loss = 0`。

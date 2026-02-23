@@ -18,7 +18,7 @@ No conclusions in this document depend on older windows.
 This project is intentionally built around a constrained optimization problem:
 
 $$
-\max \mathbb{E}[\mathrm{window\_pnl}]
+\max \mathbb{E}[P_{\mathrm{window}}]
 $$
 
 Plain text: `maximize E[window_pnl]`.
@@ -26,7 +26,7 @@ Plain text: `maximize E[window_pnl]`.
 subject to hard safety constraints:
 
 $$
-\mathrm{maker\_only},\ \mathrm{executed\_pair\_cost} \le 0.995,\ \mathrm{final\_abs\_net}=0,\ \mathrm{unmatched\_loss}=0
+\text{maker-only},\ \text{pair-cost} \le 0.995,\ \text{final abs net}=0,\ \text{unmatched loss}=0
 $$
 
 Plain text: `maker-only, executed_pair_cost <= 0.995, final_abs_net = 0, unmatched_loss = 0`.
