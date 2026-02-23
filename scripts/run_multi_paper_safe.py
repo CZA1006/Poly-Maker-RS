@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import csv
+import json
+import math
 import os
 import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
 DEFAULT_WS_HOST = "wss://ws-subscriptions-clob.polymarket.com"
@@ -94,6 +97,18 @@ def parse_args():
         type=float,
         default=None,
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--budget-roll-mode",
+        choices=["fixed", "pnl_compound"],
+        default="fixed",
+        help="Per-window budget mode: fixed or compound using previous window pnl (default: fixed)",
+    )
+    parser.add_argument(
+        "--rolling-budget-floor",
+        type=float,
+        default=1.0,
+        help="Minimum per-window budget when --budget-roll-mode=pnl_compound (default: 1.0)",
     )
     parser.add_argument("--max-rounds", type=int, default=6)
     parser.add_argument("--round-budget", type=float, default=0.0)
@@ -195,6 +210,127 @@ def resolve_global_total_budget(args: argparse.Namespace) -> float:
     if not (budget > 0 and budget < float("inf")):
         raise SystemExit(f"invalid global budget: {budget}")
     return budget
+
+
+def safe_float(value) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        out = float(value)
+        if not math.isfinite(out):
+            return None
+        return out
+    except Exception:
+        return None
+
+
+def iter_jsonl(path: Path) -> Iterable[dict]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+
+def compute_window_pnl_from_snapshot(snapshot: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    qty_up = safe_float(snapshot.get("qty_up"))
+    qty_down = safe_float(snapshot.get("qty_down"))
+    spent_total = safe_float(snapshot.get("spent_total_usdc"))
+    pair_cost = safe_float(snapshot.get("pair_cost"))
+    cost_up = safe_float(snapshot.get("cost_up"))
+    cost_down = safe_float(snapshot.get("cost_down"))
+
+    if qty_up is None or qty_down is None:
+        return None, None, None
+
+    hedgeable_shares = max(0.0, min(qty_up, qty_down))
+    unmatched_loss_usdc = None
+
+    # Keep the same strict accounting used by scripts/summarize_multi.py.
+    if spent_total is not None:
+        window_pnl = hedgeable_shares - spent_total
+        if (
+            cost_up is not None
+            and cost_down is not None
+            and qty_up > 0.0
+            and qty_down > 0.0
+        ):
+            avg_up = cost_up / qty_up
+            avg_down = cost_down / qty_down
+            if qty_up > qty_down:
+                unmatched_loss_usdc = max(0.0, cost_up - avg_up * hedgeable_shares)
+            elif qty_down > qty_up:
+                unmatched_loss_usdc = max(0.0, cost_down - avg_down * hedgeable_shares)
+            else:
+                unmatched_loss_usdc = 0.0
+        return hedgeable_shares, window_pnl, unmatched_loss_usdc
+
+    if pair_cost is None:
+        return hedgeable_shares, None, unmatched_loss_usdc
+    window_pnl = (1.0 - pair_cost) * hedgeable_shares
+    return hedgeable_shares, window_pnl, unmatched_loss_usdc
+
+
+def find_latest_paper_jsonl(log_dir: Path) -> Optional[Path]:
+    files = sorted(log_dir.glob("*_paper.jsonl"))
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_mtime)
+    return files[-1]
+
+
+def extract_last_snapshot_from_jsonl(jsonl_path: Path) -> Optional[dict]:
+    last_snapshot = None
+    last_ts = None
+    for obj in iter_jsonl(jsonl_path):
+        if obj.get("kind") != "dryrun_snapshot":
+            continue
+        data = obj.get("data", {})
+        ts = obj.get("ts_ms")
+        if ts is None:
+            ts = data.get("ts_ms")
+        if last_ts is None or (ts is not None and ts >= last_ts):
+            last_ts = ts
+            last_snapshot = data
+    return last_snapshot
+
+
+def ensure_curve_csv(path: Path) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "symbol",
+                "window_idx",
+                "window_start_ts",
+                "slug",
+                "start_budget_usdc",
+                "window_pnl_usdc",
+                "end_budget_usdc",
+                "spent_total_usdc",
+                "final_pair_cost",
+                "final_qty_up",
+                "final_qty_down",
+                "hedgeable_shares",
+                "unmatched_loss_usdc",
+                "jsonl_path",
+                "parse_ok",
+            ]
+        )
+
+
+def append_curve_row(path: Path, row: List[object]) -> None:
+    ensure_curve_csv(path)
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(row)
 
 
 def allocate_market_budgets(
@@ -398,10 +534,23 @@ async def worker(
     args: argparse.Namespace,
     market_budget: float,
     global_total_budget: float,
+    session_ts: int,
     sem: asyncio.Semaphore,
     stop_event: asyncio.Event,
     run_state: RunState,
 ):
+    if args.rolling_budget_floor <= 0:
+        raise RuntimeError("--rolling-budget-floor must be > 0")
+
+    curve_csv_path = (
+        repo_root()
+        / "logs"
+        / "multi"
+        / symbol
+        / f"budget_curve_{session_ts}.csv"
+    )
+    ensure_curve_csv(curve_csv_path)
+
     t = make_window_start(args.start_mode)
     first_slug = market_slug(symbol, t)
     print(
@@ -512,6 +661,81 @@ async def worker(
         if code != 0:
             raise RuntimeError(f"run_paper failed slug={slug} code={code}")
 
+        current_budget = market_budget
+        jsonl_path = find_latest_paper_jsonl(log_dir)
+        parse_ok = False
+        window_pnl_usdc = None
+        end_budget = current_budget
+        spent_total_usdc = None
+        final_pair_cost = None
+        final_qty_up = None
+        final_qty_down = None
+        hedgeable_shares = None
+        unmatched_loss_usdc = None
+        if jsonl_path is None:
+            print(
+                f"[{symbol}] WARN: no *_paper.jsonl found under {log_dir}, keep budget unchanged",
+                flush=True,
+            )
+        else:
+            snap = extract_last_snapshot_from_jsonl(jsonl_path)
+            if snap is None:
+                print(
+                    f"[{symbol}] WARN: no dryrun_snapshot in {jsonl_path}, keep budget unchanged",
+                    flush=True,
+                )
+            else:
+                parse_ok = True
+                spent_total_usdc = safe_float(snap.get("spent_total_usdc"))
+                final_pair_cost = safe_float(snap.get("pair_cost"))
+                final_qty_up = safe_float(snap.get("qty_up"))
+                final_qty_down = safe_float(snap.get("qty_down"))
+                hedgeable_shares, window_pnl_usdc, unmatched_loss_usdc = (
+                    compute_window_pnl_from_snapshot(snap)
+                )
+                if (
+                    args.budget_roll_mode == "pnl_compound"
+                    and window_pnl_usdc is not None
+                ):
+                    end_budget = max(
+                        args.rolling_budget_floor, current_budget + window_pnl_usdc
+                    )
+                    market_budget = end_budget
+                else:
+                    market_budget = current_budget
+                print(
+                    (
+                        f"[{symbol}] settle slug={slug} budget_start={current_budget:.4f} "
+                        f"window_pnl={window_pnl_usdc if window_pnl_usdc is not None else 'NA'} "
+                        f"budget_end={end_budget:.4f} "
+                        f"spent_total={spent_total_usdc if spent_total_usdc is not None else 'NA'} "
+                        f"pair_cost_final={final_pair_cost if final_pair_cost is not None else 'NA'} "
+                        f"jsonl={jsonl_path}"
+                    ),
+                    flush=True,
+                )
+
+        append_curve_row(
+            curve_csv_path,
+            [
+                symbol,
+                completed + 1,
+                t,
+                slug,
+                f"{current_budget:.10f}",
+                "" if window_pnl_usdc is None else f"{window_pnl_usdc:.10f}",
+                f"{end_budget:.10f}",
+                "" if spent_total_usdc is None else f"{spent_total_usdc:.10f}",
+                "" if final_pair_cost is None else f"{final_pair_cost:.10f}",
+                "" if final_qty_up is None else f"{final_qty_up:.10f}",
+                "" if final_qty_down is None else f"{final_qty_down:.10f}",
+                "" if hedgeable_shares is None else f"{hedgeable_shares:.10f}",
+                "" if unmatched_loss_usdc is None else f"{unmatched_loss_usdc:.10f}",
+                str(jsonl_path) if jsonl_path is not None else "",
+                "1" if parse_ok else "0",
+            ],
+        )
+
         completed += 1
         t += 900
 
@@ -525,18 +749,27 @@ async def main_async():
         raise SystemExit("no symbols provided")
     global_total_budget = resolve_global_total_budget(args)
     market_budgets = allocate_market_budgets(symbols, args, global_total_budget)
+    session_ts = int(time.time())
     total_assigned = sum(market_budgets.values())
     print(
         (
             f"budget_config strategy={args.budget_strategy} "
             f"global_total_budget={global_total_budget:.4f} "
             f"per_market_cap={args.per_market_budget_cap:.4f} "
-            f"total_assigned={total_assigned:.4f}"
+            f"total_assigned={total_assigned:.4f} "
+            f"budget_roll_mode={args.budget_roll_mode} "
+            f"rolling_budget_floor={args.rolling_budget_floor:.4f}"
         ),
         flush=True,
     )
     for sym in symbols:
-        print(f"[{sym}] market_budget={market_budgets[sym]:.4f}", flush=True)
+        curve_path = (
+            repo_root() / "logs" / "multi" / sym / f"budget_curve_{session_ts}.csv"
+        )
+        print(
+            f"[{sym}] market_budget={market_budgets[sym]:.4f} budget_curve_csv={curve_path}",
+            flush=True,
+        )
 
     parallelism = args.parallelism or len(symbols)
     sem = asyncio.Semaphore(max(1, parallelism))
@@ -566,6 +799,7 @@ async def main_async():
                 args,
                 market_budgets[sym],
                 global_total_budget,
+                session_ts,
                 sem,
                 stop_event,
                 run_state,
