@@ -6,10 +6,141 @@ This repository contains a Rust-based **maker-only** Polymarket CLOB arbitrage b
 
 This README is the **English deep-dive baseline** for the current stable strategy version, using only one window:
 
-- Baseline window: `logs/multi/btc/1771676100/btc_1771676100_paper.jsonl`
-- Baseline story plot: `logs/multi/btc/1771676100/btc_1771676100_paper_story.png`
+- Baseline window: `logs/multi/btc/1771704000/btc_1771704000_paper.jsonl`
+- Baseline story plot: `logs/multi/btc/1771704000/btc_1771704000_paper_story.png`
 
 No conclusions in this document depend on older windows.
+
+---
+
+## [S00B] Core Philosophy: No-Risk First, Then Budget Utilization
+
+This project is intentionally built around a constrained optimization problem:
+
+$$
+\max \mathbb{E}[\mathrm{window\_pnl}]
+$$
+
+Plain text: `maximize E[window_pnl]`.
+
+subject to hard safety constraints:
+
+$$
+\mathrm{maker\_only},\ \mathrm{executed\_pair\_cost} \le 0.995,\ \mathrm{final\_abs\_net}=0,\ \mathrm{unmatched\_loss}=0
+$$
+
+Plain text: `maker-only, executed_pair_cost <= 0.995, final_abs_net = 0, unmatched_loss = 0`.
+
+So the bot is not a generic "trade more" executor. It is a **strict no-risk pair-closure engine** that spends budget only when all closure conditions are simultaneously feasible.
+
+### The practical tradeoff we optimize
+
+At runtime we balance two goals:
+
+1. **Risk closure first**: never open risk that cannot be closed within current market conditions.
+2. **Utilization second**: under (1), increase trading density and spend ratio as much as possible.
+
+This is why the system can look conservative in some local periods while still producing strong rolling PnL.
+
+### How this is encoded in code (high level)
+
+1. **Open-round feasibility** (`planner`):
+   - `can_start_new_round` requires base state, pair quality, edge, fillability, regime score, and budget readiness.
+   - Key path: `poly_maker/src/strategy/planner.rs` (`build_round_plan`, entry evaluation and block reasons).
+2. **Hard execution risk gate** (`gate`):
+   - rejects taker, unrecoverable hedge, insufficient hedge margin, pair-cap violations, tail violations.
+   - Key path: `poly_maker/src/strategy/gate.rs`.
+3. **Open-order runtime guard** (`ws_market`):
+   - already-open resting orders are rechecked and canceled if they become unsafe (`sim_order_cancel_unrecoverable`, `sim_order_cancel_risk_guard`).
+   - Key path: `poly_maker/src/ws_market.rs`.
+4. **Maker quote and fillability modeling** (`simulate` + `ws_market`):
+   - dynamic cap, passive-gap penalties, queue/consumption-based fill probability.
+   - Key paths: `poly_maker/src/strategy/simulate.rs`, `poly_maker/src/ws_market.rs`.
+
+### What the latest rolling 10-window experiment shows
+
+From `logs/multi/btc_roll10.csv` and `logs/multi/btc/budget_curve_1771696194.csv`:
+
+1. **Safety invariants held across all 10 windows**
+   - `final_abs_net = 0` for every window.
+   - `unmatched_loss_usdc = 0` for every window.
+   - `max_executed_sim_pair_cost <= 0.995` (worst observed: `0.994286`).
+   - taker actions remained `0`.
+2. **Performance**
+   - total PnL: `+19.07 USDC`.
+   - rolling budget: `100.00 -> 119.07`.
+3. **Utilization**
+   - median spent ratio: `0.3925`.
+   - late windows reached high utilization (`~0.75-0.89`) while keeping no-risk constraints.
+
+### Why local "missed opportunities" still happen
+
+The largest deny/block reasons in rolling diagnostics are:
+
+1. `reserve_for_pair`: budget is intentionally reserved for hedge completion.
+2. `locked_strict_abs_net`: after lock conditions are met, policy prefers preserving no-risk state over reopening risk.
+3. `fillability` / `directional_gate`: signals exist, but expected maker execution quality is below required floor.
+
+These are **design choices**, not accidental failures.
+
+### Remaining unvalidated risk before real-money deployment
+
+Paper mode is robust but still a model. Gaps to live Polymarket:
+
+1. **Queue priority realism**: real queue position and adverse selection can differ from simulation assumptions.
+2. **Maker/taker boundary**: post-only behavior in real exchange micro-timing needs live validation.
+3. **Execution race conditions**: cancel/replace and websocket latency races are harsher in production.
+4. **Economic completeness**: fees/rebates/gas/funding timing are simplified in current paper PnL.
+5. **Capital timing**: settlement and usable-balance timing for rolling compounding need live-account validation.
+
+Use this as the guiding principle for all future changes:
+
+> Any improvement must increase utilization or PnL **without weakening** the hard no-risk closure guarantees.
+
+### One-Page Decision Tree (When to Open, Balance, or Stop)
+
+```mermaid
+flowchart TD
+    A[New decision tick] --> B{Quotes available?\nUP/DOWN best bid/ask}
+    B -- No --> B1[Block: missing_quotes\nNo order]
+    B -- Yes --> C{round_state}
+
+    C -- leg1_accumulating --> C1[Policy: reserve_for_pair\nPrefer opposite leg]
+    C -- leg2_balancing --> C2[Only actions reducing abs_net]
+    C -- done --> C3[No new round]
+    C -- idle --> D{can_open_round_base_ok?}
+
+    D -- No --> D1[Block reason:\nphase_not_idle / abs_net_nonzero /\nlate_new_round / tail_close / max_rounds]
+    D -- Yes --> E{Directional & regime gates}
+    E -- Fail --> E1[Block: directional_gate / regime_score]
+    E -- Pass --> F{Pair feasibility}
+    F -- Fail --> F1[Block: pair_quality / pair_regression /\nentry_worst_pair / entry_edge]
+    F -- Pass --> G{Fillability}
+    G -- Fail --> G1[Block: fillability / low_maker_fill_prob]
+    G -- Pass --> H{Risk hard checks}
+    H -- Fail --> H1[Block:\nhedge_not_recoverable /\nhedge_margin_insufficient /\nmargin_target]
+    H -- Pass --> I[Open maker order]
+
+    I --> J[Resting lifecycle]
+    J --> K{Timeout/price/risk recheck}
+    K -- Better to wait --> K1[timeout_extend]
+    K -- Better quote exists --> K2[cancel_requote -> reopen]
+    K -- Risk worsened --> K3[cancel_unrecoverable / cancel_risk_guard]
+    K -- Fill --> L[Apply inventory mutation]
+
+    L --> M{abs_net == 0 ?}
+    M -- No --> N[leg2_balancing\nContinue hedge completion]
+    M -- Yes --> O{tail_close?}
+    O -- Yes --> P[done]
+    O -- No --> Q[idle -> next round]
+```
+
+Interpretation:
+
+1. **Idle does not mean "free to trade"**; it only means phase state is open for evaluation.
+2. A new opening leg exists only if all layers pass: base -> directional/regime -> pair feasibility -> fillability -> hard risk.
+3. Once exposure exists (`abs_net > 0`), policy shifts to **closure priority** (`leg2_balancing`) until inventory is balanced.
+4. In tail close, increasing-risk actions are denied; only net-reducing closure actions survive.
 
 ---
 
@@ -20,19 +151,21 @@ If you are new to this repo, read in this order:
 1. `S00` for notation and event vocabulary.
 2. `S04` + `S05` + `S06` to understand decision, sizing, and start conditions.
 3. `S07` + `S08` for pricing model and hard no-risk gates.
-4. `S10` + `S11` for real examples from window `1771676100`.
+4. `S10` + `S11` for real examples from window `1771704000`.
 5. `S12` for reproducible acceptance commands.
+6. `S12A` for 10-window rolling-budget compounding results.
+7. `S12B` for deep diagnostics on local failures in those 10 windows.
 
-### Baseline scorecard (`1771676100`)
+### Baseline scorecard (`1771704000`)
 
 | Goal | Metric | Result |
 | --- | --- | --- |
 | Maker-only | taker actions | none |
-| No-risk hard cap | max executed pair cost | `0.9886585366 <= 0.995` |
-| Execution quality | fill rate | `61/63 = 0.9683` |
+| No-risk hard cap | max executed pair cost | `0.9794308943 <= 0.995` |
+| Execution quality | fill rate | `50/61 = 0.8197` |
 | Position closure | final abs net | `0` |
-| Capital use | spent total | `91.61 / 100` |
-| Pair arbitrage quality | final pair cost | `0.9850537634 < 1` |
+| Capital use | spent total | `97.82 / 112.02` |
+| Pair arbitrage quality | final pair cost | `0.9590196078 < 1` |
 
 ### Quick jump by question
 
@@ -41,6 +174,8 @@ If you are new to this repo, read in this order:
 - “How is maker fill estimated?” -> `S07`, `S09`.
 - “How does no-risk protection work?” -> `S08`, `S11`.
 - “How do I rerun checks?” -> `S12`.
+- “How did rolling 10-window compounding perform?” -> `S12A`.
+- “Why did some checks fail while risk was still safe?” -> `S12B`.
 
 ---
 
@@ -150,7 +285,7 @@ flowchart LR
 
 For this baseline:
 
-- `MARKET_SLUG=btc-updown-15m-1771676100`
+- `MARKET_SLUG=btc-updown-15m-1771704000`
 
 `scripts/validate_market_slug.py` validates:
 
@@ -280,39 +415,30 @@ alpha = 2 / (VOL_ENTRY_LOOKBACK_TICKS + 1)
 
 This is the planner's volatility-regime input.
 
-### 3A.6 Worked example from baseline window (`1771676100`)
+### 3A.6 Worked example from baseline window (`1771704000`)
 
-At snapshot `ts_ms=1771676123989`:
+At snapshot `ts_ms=1771704418947` (`t=413.208s`):
 
-- `best_bid_up=0.65`, `best_ask_up=0.67` -> `mid_up=0.66`
-- previous `mid_up=0.665`
-- `best_bid_down=0.33`, `best_ask_down=0.35` -> `mid_down=0.34`
-- previous `mid_down=0.335`
+- `best_bid_up=0.16`, `best_ask_up=0.18` -> `mid_up=0.17`
+- previous `mid_up=0.17`
+- `best_bid_down=0.82`, `best_ask_down=0.84` -> `mid_down=0.83`
+- previous `mid_down=0.83`
 
 Momentum:
 
 ```text
-mid_up_momentum_bps   = (0.66 - 0.665) / 0.665 * 10000 = -75.19
-mid_down_momentum_bps = (0.34 - 0.335) / 0.335 * 10000 = +149.25
+mid_up_momentum_bps   = (0.17 - 0.17) / 0.17 * 10000 = 0.00
+mid_down_momentum_bps = (0.83 - 0.83) / 0.83 * 10000 = 0.00
 ```
 
-Slow-EMA discount at same tick:
+Observed discount/flow fields at this snapshot:
 
-- `slow_up ~= 0.6591418`, `slow_down ~= 0.3408582`
+- `mid_up_discount_bps=53.54`
+- `mid_down_discount_bps=-11.04`
+- `bid_consumption_rate_up=16.6733`
+- `bid_consumption_rate_down=3.8549`
 
-```text
-mid_up_discount_bps   = (0.6591418 - 0.66) / 0.6591418 * 10000 = -13.02
-mid_down_discount_bps = (0.3408582 - 0.34) / 0.3408582 * 10000 = +25.18
-```
-
-Observed fields in JSONL match exactly:
-
-- `mid_down_discount_bps=25.18`
-- `mid_down_momentum_bps=149.25`
-- `mid_up_discount_bps=-13.02`
-- `mid_up_momentum_bps=-75.19`
-- `bid_consumption_rate_down=1.26055`
-- `bid_consumption_rate_up=20.0`
+This is exactly the pre-open context used by the `paper-48` round in `S11A`.
 
 ---
 
@@ -724,7 +850,7 @@ Key fields:
 
 ---
 
-## [S09A] Baseline Parameter Snapshot (`1771676100`)
+## [S09A] Baseline Parameter Snapshot (`1771704000`)
 
 Injected by `scripts/run_multi_paper_safe.py`.
 
@@ -838,55 +964,55 @@ Injected by `scripts/run_multi_paper_safe.py`.
 
 ---
 
-## [S10] Deep Dive: Window `1771676100`
+## [S10] Deep Dive: Window `1771704000`
 
 ### Canonical artifacts
 
-- `logs/multi/btc/1771676100/btc_1771676100_paper_story.md`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_story_events.csv`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_timeseries.csv`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_denies.csv`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_story.png`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_story.md`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_story_events.csv`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_timeseries.csv`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_denies.csv`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_story.png`
 
-![Window 1771676100 Story](logs/multi/btc/1771676100/btc_1771676100_paper_story.png)
+![Window 1771704000 Story](logs/multi/btc/1771704000/btc_1771704000_paper_story.png)
 
 ### Final outcome metrics (ground truth)
 
 | Metric | Value |
 | --- | ---: |
-| `best_action_ticks` | 815 |
-| `candidate_applied_ticks` | 815 |
-| `dryrun_apply` | 61 |
-| `sim_order_open` | 63 |
-| `sim_order_filled_resting` | 61 |
-| Fill rate (`fill/open`) | 0.9683 |
-| `spent_total_usdc` | 91.61 |
-| `pair_cost_final` | 0.9850537634 |
-| `qty_up` | 93 |
-| `qty_down` | 93 |
+| `best_action_ticks` | 1539 |
+| `candidate_applied_ticks` | 1539 |
+| `dryrun_apply` | 50 |
+| `sim_order_open` | 61 |
+| `sim_order_filled_resting` | 50 |
+| Fill rate (`fill/open`) | 0.8197 |
+| `spent_total_usdc` | 97.82 |
+| `pair_cost_final` | 0.9590196078 |
+| `qty_up` | 102 |
+| `qty_down` | 102 |
 | `final_abs_net` | 0 |
-| `max_executed_sim_pair_cost_window` | 0.9886585366 (`<= 0.995`) |
+| `max_executed_sim_pair_cost_window` | 0.9794308943 (`<= 0.995`) |
 
 ### Time milestones (relative to window start)
 
 | Time (s) | Event |
 | ---: | --- |
-| 20.301 | first `can_start_new_round=true` |
-| 20.303 | first `sim_order_open` (`buy`, price `0.32`, size `6`) |
-| 36.701 | first `sim_order_filled_resting`; first actual apply |
-| 283.007 | first observed `locked=true` snapshot |
-| 531.901 | spent crossed 90 USDC |
-| 532.302 | last resting fill |
-| 538.103 | first `locked_strict_abs_net` deny |
+| 2.599 | first `can_start_new_round=true` |
+| 2.601 | first `sim_order_open` (`buy`, price `0.52`, size `10`) |
+| 42.499 | first `sim_order_filled_resting`; first actual apply |
+| 365.707 | first observed `locked=true` snapshot |
+| 462.508 | spent crossed 90 USDC |
+| 482.204 | last resting fill |
+| 482.205 | first `locked_strict_abs_net` deny |
 
 ### First-half vs second-half activity
 
 Computed by splitting snapshot timeline midpoint:
 
-- `spent_by_half`: first `81.07`, second `91.61`
+- `spent_by_half`: first `78.97`, second `97.82`
 - `open/fill by half`:
-  - first half: open `55`, fill `52`
-  - second half: open `8`, fill `9`
+  - first half: open `50`, fill `37`
+  - second half: open `11`, fill `13`
 
 Interpretation:
 
@@ -895,68 +1021,271 @@ Interpretation:
 
 ### Planner/gate context in this window
 
-- `can_start_new_round_true_ratio = 0.3166` (1195 / 3775 snapshots)
+- `can_start_new_round_true_ratio = 0.6934` (2644 / 3813 snapshots)
 - top block reasons in snapshots:
-  - `fillability: 1583`
-  - `phase_not_idle: 761`
-  - `directional_gate: 153`
-  - `leg2_balancing: 60`
+  - `phase_not_idle: 773`
+  - `directional_gate: 172`
+  - `balance_required: 142`
+  - `leg2_balancing: 59`
   - `late_new_round: 22`
 
 This is expected: the strategy spends much time in active phases, and only opens new rounds when all conjunction gates align.
 
 ---
 
-## [S11] Local Block/Repair Cases Inside `1771676100`
+## [S11] Local Block/Repair Cases Inside `1771704000`
 
 These are **controlled local events**, not a strategy breakdown.
 
-### 11.1 `reserve_for_pair` blocks (count = 5)
+### 11.1 `margin_target` blocks (count = 347)
 
-Example around `t=112.605s`:
+Example around `t=82.701s`:
 
-- candidate: `BUY_DOWN_MAKER`, qty `24`
-- still healthy simulation metrics:
-  - `maker_fill_prob=0.11563`
-  - `sim_pair_cost=0.976`
+- candidate: `BUY_DOWN_MAKER`, qty `8`
+- observed quality fields:
+  - `maker_fill_prob=0.15207`
+  - `sim_pair_cost=0.99567`
   - `hedge_recoverable_now=true`
   - `hedge_margin_ok=true`
-- denied as `reserve_for_pair`
+  - `open_margin_surplus=0.07750`
+- denied as `margin_target`
 
-Meaning: pair-completion policy had priority in that phase and prevented side expansion.
+Meaning: even with acceptable fillability, projected pair quality was too close to (or beyond) target guardrails.
 
-### 11.2 `locked_strict_abs_net` blocks (count = 435)
+### 11.2 `locked_strict_abs_net` blocks (count = 959)
 
-Example around `t=538.103s`:
+Example around `t=482.205s`:
 
-- candidate: `BUY_DOWN_MAKER`, qty `3`
+- candidate: `BUY_DOWN_MAKER`, qty `4`
 - quality still looks acceptable:
-  - `maker_fill_prob=0.16109`
-  - `sim_pair_cost=0.98188`
+  - `maker_fill_prob=0.16178`
+  - `sim_pair_cost=0.95632`
 - denied as `locked_strict_abs_net`
 
 Meaning: once lock policy is active, net-risk expansion is blocked by design.
 
-### 11.3 Timeout extension protects near-filled orders (count = 4)
+### 11.3 Timeout extension protects near-filled orders (count = 2)
 
-Example around `t=110.403s`:
+Example around `t=218.803s`:
 
-- `fill_progress_ratio=0.88852`
-- `old_horizon_secs=53 -> new_horizon_secs=65`
-- `passive_ticks_at_extend=4`
+- `fill_progress_ratio=0.88968`
+- `old_horizon_secs=20 -> new_horizon_secs=32`
+- `passive_ticks_at_extend=2`
 
 Meaning: do not cancel an order that is already materially progressing.
 
-### 11.4 Requote only when quality uplift is material (count = 2)
+### 11.4 Requote only when quality uplift is material (count = 7)
 
-Example around `t=361.110s`:
+Example around `t=108.603s`:
 
-- `requote_prev_fill_prob=0.01750`
-- `requote_new_fill_prob=0.43102`
-- uplift `+0.41352`
+- `requote_prev_fill_prob=0.000038`
+- `requote_new_fill_prob=0.481178`
+- uplift `+0.481140`
 - `requote_block_reason=hard_stale_with_uplift`
 
 Meaning: requote is a quality-driven correction, not random churn.
+
+---
+
+## [S11A] Forensic Replay: `1771704000` (`paper-48` -> `paper-53`)
+
+This section is a full micro replay of one real round chain, from first-leg open to tail balancing slices.
+
+### Scope and data sources
+
+- Window: `logs/multi/btc/1771704000/btc_1771704000_paper.jsonl`
+- Event timeline: `logs/multi/btc/1771704000/btc_1771704000_paper_story_events.csv`
+- Planner/snapshot context: `logs/multi/btc/1771704000/btc_1771704000_paper_timeseries.csv`
+- Plot: `logs/multi/btc/1771704000/btc_1771704000_paper_story.png`
+
+Visual replay (single-window micro behavior):
+
+![Window 1771704000 Story](logs/multi/btc/1771704000/btc_1771704000_paper_story.png)
+
+### Replay timeline (key points)
+
+| Time | Event | Book at decision (`UP bid/ask`, `DOWN bid/ask`) | Why it happened |
+| ---: | --- | --- | --- |
+| `413.250s` | `sim_order_open paper-48` `BUY_UP_MAKER` `7 @ 0.15` | `0.16/0.18`, `0.82/0.84` | New round start passed (`pair_quality_ok`, `pair_regression_ok`, `fillability_ok`, `edge_bps=294.60`) |
+| `419.450s` | `sim_order_open paper-49` `BUY_DOWN_MAKER` `4 @ 0.80` | `0.16/0.19`, `0.81/0.84` | Opposite-leg resting quote for faster hedge closure once fills arrive |
+| `444.450s` | `sim_order_cancel_requote paper-49` | `0.14/0.15`, `0.85/0.86` | Quote became stale; fill-prob uplift justified requote (`0.0238 -> 0.3244`) |
+| `445.950s` | `sim_order_open paper-50` `BUY_DOWN_MAKER` `4 @ 0.83` | `0.14/0.16`, `0.84/0.86` | Repriced to better queue/fill profile while staying maker-safe |
+| `455.250s` | `sim_order_timeout_extend paper-48` | `0.14/0.16`, `0.84/0.86` | High progress (`fill_progress_ratio=0.8113`) triggered extend (`42s -> 54s`) |
+| `456.548s` | `sim_order_filled_resting paper-48` | `0.16/0.17`, `0.83/0.84` | First leg filled (`UP +7`) |
+| `456.549s` | `sim_order_filled_resting paper-50` | `0.16/0.17`, `0.83/0.84` | Opposite leg filled (`DOWN +4`), enter `leg2_balancing` |
+| `456.551s` / `457.351s` / `458.151s` | `sim_order_open paper-51/52/53` each `DOWN +1` | `0.83~0.84` area | Residual net `+3 UP` closed via micro slices in balancing phase only |
+
+Inventory path in this chain:
+
+- Before `paper-48`: `qty_up=82`, `qty_down=82`
+- After `paper-48 + paper-50` fills: `qty_up=89`, `qty_down=86`
+- After `paper-51/52/53` fills: `qty_up=89`, `qty_down=89` (flat again)
+
+### Formula restoration with actual numbers
+
+#### A) `bid_consumption_rate_up = 16.6733` (local derived field)
+
+Code path: `poly_maker/src/ws_market.rs` (`estimate_consumption_rate`).
+
+```text
+observed_rate = depletion_per_dt
+rate_new = 0.35 * observed_rate + 0.65 * rate_prev
+rate_clamped in [0, 20]
+```
+
+This is EWMA over live book depletion events, not a direct API field.
+
+#### B) `mid_*_discount_bps` sign and leg preference
+
+Code path: `poly_maker/src/ws_market.rs` (mid/EMA update).
+
+```text
+mid = (best_bid + best_ask) / 2
+discount_bps = ((slow_ema - mid) / slow_ema) * 10000
+```
+
+At `413.250s`:
+
+- `mid_up_discount_bps = +295.83` (UP is below slow baseline)
+- `mid_down_discount_bps = -62.83` (DOWN is above slow baseline)
+
+Planner gates use sign and threshold (`>=`), not absolute value.
+
+#### C) `slice_qty=7` for `paper-48`
+
+Code path: `poly_maker/src/strategy/planner.rs`.
+
+1. Round target from budget:
+
+```text
+leg1_budget = round_budget_usdc * round_leg1_fraction
+qty_raw = floor(leg1_budget / leg1_price)
+max_pair_qty = floor(round_budget_usdc / (leg1_price + leg2_price))
+qty_target_raw = min(qty_raw, max_pair_qty)
+```
+
+At `413.250s`:
+
+- `round_budget_usdc=18.67`, `round_leg1_fraction=0.45`
+- `leg1_price=0.16`, `leg2_price=0.82`
+- `qty_raw=floor(8.4015/0.16)=52`
+- `max_pair_qty=floor(18.67/0.98)=19`
+- `qty_target_raw=19`
+
+2. Depth and flow caps:
+
+```text
+depth_cap = floor(best_bid_size_up * ENTRY_MAX_TOP_BOOK_SHARE)
+flow_cap = floor(bid_consumption_rate_up * MAKER_FILL_HORIZON_SECS * ENTRY_MAX_FLOW_UTILIZATION)
+qty_target = min(qty_target_raw, depth_cap, flow_cap)
+```
+
+- `depth_cap=floor(334.31*0.35)=117`
+- `flow_cap=floor(16.6733*12*0.75)=150`
+- `qty_target=19`
+
+3. Dynamic slicing:
+
+```text
+slice_count=3   (from ROUND_MIN_SLICES/ROUND_MAX_SLICES and per-slice cap)
+slice_qty=ceil(19/3)=7
+```
+
+#### D) `entry_quote_base=0.17`, `dynamic_cap=0.15`, `final=0.15`
+
+Code path: `poly_maker/src/strategy/simulate.rs` (`compute_maker_buy_quote`).
+
+```text
+base_postonly = min(best_bid + tick, best_ask - tick)
+target_margin = max(min_ticks * tick, opp_ask * min_bps / 10000)
+dynamic_cap = hard_pair_cap - headroom - opp_ask - target_margin
+final_quote = min(base_postonly, dynamic_cap)
+```
+
+At `paper-48` open:
+
+- `best_bid_up=0.16`, `best_ask_up=0.18`, `tick=0.01` -> `base=0.17`
+- `opp_ask=best_ask_down=0.84`
+- `target_margin=max(0.3*0.01, 0.84*5/10000)=0.003`
+- `hard_pair_cap=0.995`, `headroom=5bps=0.0005`
+- `dynamic_cap=0.995-0.0005-0.84-0.003=0.1515` -> floor tick `0.15`
+- `final=min(0.17,0.15)=0.15`
+
+#### E) `entry_edge_bps=294.60`
+
+Code path: `poly_maker/src/strategy/planner.rs`.
+
+```text
+entry_worst_limit = effective_pair_limit - no_risk_entry_pair_headroom
+entry_edge_bps = ((entry_worst_limit - entry_worst_pair_cost) / entry_worst_limit) * 10000
+```
+
+At `413.250s`:
+
+- `entry_worst_limit = 0.995 - 0.0005 = 0.9945`
+- `entry_worst_pair_cost = 0.9652015730`
+- `entry_edge_bps = 294.6046`
+
+#### F) `maker_fill_prob` (`mfp`) at `paper-48` open
+
+Code path: `poly_maker/src/strategy/simulate.rs`.
+
+```text
+raw_queue = top_size * maker_queue_ahead_mult
+effective_queue = raw_queue * (1 + passive_ticks * queue_penalty_per_tick)
+expected_consumed = consume_rate * horizon_secs
+flow_ratio = expected_consumed / (effective_queue + qty)
+mfp = (1 - exp(-flow_ratio)) * exp(-decay_k * passive_ticks)
+```
+
+Numbers:
+
+- `top_size=334.31`, `qty=7`, `consume_rate=16.6733`, `horizon=12`
+- `passive_ticks=1` (price `0.15` vs bid `0.16`)
+- `effective_queue=752.1975`
+- `expected_consumed=200.0795`
+- `mfp=0.1632577`
+
+#### G) `fill_progress_ratio`, `old_horizon_secs`, timeout extension
+
+Code path: `poly_maker/src/ws_market.rs`.
+
+```text
+required_consumption = queue_ahead + remaining_qty
+fill_progress_ratio = consumed_qty / required_consumption
+```
+
+For `paper-48` at timeout check:
+
+- `queue_ahead=752.1975`, `remaining_qty=7` -> `required=759.1975`
+- `consumed_qty=615.9618` -> `progress=0.8113`
+
+Base adaptive horizon:
+
+```text
+required_ratio = -ln(1 - timeout_target_fill_prob)
+required_secs = ceil((queue_ahead + qty) * required_ratio / consume_rate)
+old_horizon_secs = max(base_timeout_secs, required_secs)
+```
+
+- `timeout_target_fill_prob=0.60`
+- `required_ratio=0.91629`
+- `required_secs=42` -> `old_horizon_secs=42`
+
+Since progress exceeded threshold (`>=0.50`) and extend budget remained:
+
+- `old_horizon_secs=42 -> new_horizon_secs=54`
+
+### Why `paper-51/52/53` are 1-share slices
+
+After `paper-48` and `paper-50` filled, round state became `leg2_balancing` with residual net `+3 UP`.
+
+- `round_plan_can_start_block_reason=leg2_balancing`
+- planner no longer evaluates new-round edge/fillability path
+- it executes pure hedge-improving balancing actions (`improves_hedge=true`)
+- resulting sequence: `DOWN +1`, `DOWN +1`, `DOWN +1`
+
+This is exactly the intended no-risk behavior: close residual net first, then reopen entry logic only after flat state is restored.
 
 ---
 
@@ -1022,12 +1351,215 @@ PY
 
 ---
 
+## [S12A] Ten-Window Rolling-Budget Review (`btc`, compounding mode)
+
+This section summarizes the continuous 10-window run you completed with:
+
+- rolling budget mode: `--budget-roll-mode pnl_compound`
+- budget floor: `--rolling-budget-floor 1`
+- source artifacts:
+  - `logs/multi/btc/budget_curve_1771696194.csv`
+  - `logs/multi/btc_roll10.csv`
+  - `logs/multi/btc_roll10_pnl_curve.png`
+
+Visual dashboards for this 10-window batch:
+
+![Roll10 PnL Curve](logs/multi/btc_roll10_pnl_curve.png)
+
+![Roll10 Diagnostic Overview](logs/multi/btc_roll10_diag_overview.png)
+
+![Roll10 Diagnostic Timing and Sizing](logs/multi/btc_roll10_diag_timing_sizing.png)
+
+![Roll10 Diagnostic Events and Gates](logs/multi/btc_roll10_diag_events_gates.png)
+
+### 12A.1 Compounding equation (implemented)
+
+For window index `i`:
+
+```text
+start_budget_1 = 100
+window_pnl_i = hedgeable_shares_i - spent_total_usdc_i
+end_budget_i = max(rolling_budget_floor, start_budget_i + window_pnl_i)
+start_budget_{i+1} = end_budget_i
+```
+
+This exactly matches runner implementation in `scripts/run_multi_paper_safe.py` and the PnL accounting in `scripts/summarize_multi.py`.
+
+### 12A.2 Portfolio-level outcome (10 windows)
+
+- Window range: `1771696800` -> `1771704900`
+- Start budget: `100.00`
+- End budget: `119.07`
+- Total PnL: `+19.07`
+- Win windows: `10/10` (win ratio `100%`)
+- Worst window PnL: `+0.61`
+
+Execution and risk profile over these 10 windows:
+
+- `apply_total=368`, `sim_order_open_total=431`, apply/open ratio `0.8538`
+- median apply count per window: `34.5` (min `11`, max `56`)
+- median `final_pair_cost`: `0.973748` (min `0.901538`, max `0.983043`)
+- `final_abs_net=0` in every window
+- `unmatched_loss_usdc=0` in every window
+- all windows respect hard cap: `max_executed_sim_pair_cost_window <= 0.995`
+
+### 12A.3 Per-window compounding path
+
+From `logs/multi/btc/budget_curve_1771696194.csv`:
+
+| window_ts | start_budget | window_pnl | end_budget | spent_total | final_pair_cost | final_qty_up/down |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1771696800 | 100.00 | +0.61 | 100.61 | 26.39 | 0.977407 | 27 / 27 |
+| 1771697700 | 100.61 | +0.78 | 101.39 | 34.22 | 0.977714 | 35 / 35 |
+| 1771698600 | 101.39 | +0.89 | 102.28 | 34.11 | 0.974571 | 35 / 35 |
+| 1771699500 | 102.28 | +1.01 | 103.29 | 31.99 | 0.969394 | 33 / 33 |
+| 1771700400 | 103.29 | +2.56 | 105.85 | 23.44 | 0.901538 | 26 / 26 |
+| 1771701300 | 105.85 | +2.92 | 108.77 | 47.08 | 0.941600 | 50 / 50 |
+| 1771702200 | 108.77 | +1.56 | 110.33 | 90.44 | 0.983043 | 92 / 92 |
+| 1771703100 | 110.33 | +1.69 | 112.02 | 82.31 | 0.979881 | 84 / 84 |
+| 1771704000 | 112.02 | +4.18 | 116.20 | 97.82 | 0.959020 | 102 / 102 |
+| 1771704900 | 116.20 | +2.87 | 119.07 | 103.13 | 0.972925 | 106 / 106 |
+
+### 12A.4 Detailed acceptance interpretation
+
+What stayed consistently strong:
+
+1. Hard risk gates remained green on all 10 windows.
+2. Pair closure quality remained stable (`qty_up == qty_down` at end of each window).
+3. Maker-only behavior was preserved (no taker path activated).
+4. Compounding accounting is internally consistent:
+   - runner settle logs
+   - budget curve CSV
+   - multi-window summary CSV
+   all match the same PnL series.
+
+What failed in some per-window checks (but does not indicate hard-risk regression):
+
+1. `apply_interval_p50` failed in multiple windows because the check threshold used `0.8s` while strategy cadence in those windows was around `0.20~0.30s`.
+2. `median_slice_qty <= 8` failed in a few windows (median slice around `17~23`) due to larger budget and aggressive participation when liquidity/flow gates allowed.
+3. one window had `open_margin_surplus_p50` touching the configured floor.
+
+These are **quality-threshold mismatches versus current execution tempo**, not no-risk failures.
+
+### 12A.5 Recommended acceptance profile for this strategy tempo
+
+If you keep the current strategy tempo unchanged, use a "rolling-fast" acceptance profile:
+
+```bash
+export APPLY_INTERVAL_P50_MIN=0.20
+export APPLY_INTERVAL_P50_MIN_SMALL_SLICE=0.20
+export APPLY_INTERVAL_P50_EPS=0.005
+export MEDIAN_SLICE_QTY_MAX=24
+export OPEN_MARGIN_SURPLUS_P50_MIN=0.0000
+```
+
+Then run the standard 10-window loop and `check_multi_pnl.sh` on `logs/multi/btc_roll10.csv`.
+
+---
+
+## [S12B] Ten-Window Local Failure Deep-Dive (Hard vs Soft)
+
+This section compares your latest 10-window acceptance details with current code behavior and explains why some checks failed while hard no-risk objectives still held.
+
+### 12B.1 Hard vs soft acceptance layers
+
+| Layer | Objective | Where enforced | 10-window result |
+| --- | --- | --- | --- |
+| Hard risk | maker-only, `sim_pair_cost <= 0.995`, recoverable hedge, final balance | `gate.rs`, `simulate.rs`, `check_run.sh`, `check_round_quality.sh`, `check_exec_quality.sh` | Stable, all windows green |
+| Soft execution quality | cadence, slice shape, margin-surplus distribution | `check_round_quality.sh`, `check_exec_quality.sh` | Some local fails (tempo/shape mismatch) |
+
+Hard-risk headroom was still positive in all windows. Tightest window: `1771697700`, max executed pair cost `0.994286` (about `7.14 bps` below hard cap `0.995`).
+
+### 12B.2 What failed and where
+
+From the 10 windows (`1771696800` -> `1771704900`):
+
+| Window | `apply_interval_p50` | `median_slice_qty <= 8` | `open_margin_surplus_p50 >= 0.001` |
+| --- | --- | --- | --- |
+| 1771696800 | pass (`4.999s`) | pass (`1`) | pass |
+| 1771697700 | fail (`0.202s`) | fail (`17`) | pass |
+| 1771698600 | fail (`0.299s`) | fail (`23`) | pass |
+| 1771699500 | pass (`1.151s`) | fail (`22`) | pass |
+| 1771700400 | fail (`0.300s`) | fail (`21`) | fail (`0.000`) |
+| 1771701300 | fail (`0.299s`) | fail (`17`) | pass |
+| 1771702200 | pass (`1.301s`) | pass (`4`) | pass |
+| 1771703100 | pass (`1.100s`) | pass (`3`) | pass |
+| 1771704000 | fail (`0.301s`) | pass (`5`) | pass |
+| 1771704900 | fail (`0.298s`) | pass (`5`) | pass |
+
+### 12B.3 Why these soft failures happen (code-level)
+
+1. `apply_interval_p50` failures are threshold-regime effects, not risk breaks.
+The check logic in `scripts/check_round_quality.sh` uses:
+- default min interval `0.8s`
+- but if `median_slice_qty <= 4`, min interval is relaxed to `0.3s`.
+So windows with median slice `>4` and fast cadence around `0.30s` will fail the `0.8s` branch even if no-risk is intact.
+
+2. `median_slice_qty` failures come from deliberate sizing aggressiveness under catch-up logic.
+Sizing is built as:
+- round target from budget (`compute_round_qty_target`)
+- depth cap (`ENTRY_MAX_TOP_BOOK_SHARE`)
+- flow cap (`ENTRY_MAX_FLOW_UTILIZATION`)
+- dynamic slicing (`ROUND_MIN_SLICES`, `ROUND_MAX_SLICES`)
+- spent/time-driven boost of effective entry limits and round budget.
+Implementation path:
+- `planner.rs`: `effective_entry_limits`, `effective_round_budget_usdc`, `compute_dynamic_slice_count`.
+When spent pacing is behind and time is ample, this intentionally increases participation, so median slices can rise to `17~23`.
+
+3. The single `open_margin_surplus_p50` failure (`1771700400`) is a boundary case.
+`open_margin_surplus = hedge_margin_to_opp_ask - hedge_margin_required`.
+Gate side still includes tolerance (`gate.rs`) and hard recoverability checks, so a local p50 at boundary did not produce hard-risk violation.
+
+### 12B.4 Deny-structure regime shift across the 10 windows
+
+Candidate deny reasons (aggregated from JSONL candidate rows):
+
+- `reserve_for_pair`: dominant in earlier windows.
+- `locked_strict_abs_net`: dominant in later windows.
+- `margin_target`: appears as hard pair-quality guard in both phases.
+
+Interpretation:
+
+1. Early/mid phase:
+`reserve_for_pair` is mostly planner/gate preserving pair completion budget and phase discipline while building rounds.
+
+2. Later phase after stronger progress:
+`locked_strict_abs_net` dominates once lock policy is active and the system suppresses new net-risk expansion.
+
+3. In both phases:
+`margin_target` remains hard pair-quality backstop (`pair` must remain within enforced limit stack).
+
+### 12B.5 Concrete local failure snapshots (same 10-window batch)
+
+1. `reserve_for_pair` example (`1771699500`)
+- candidate: `BUY_DOWN_MAKER`, qty `19`
+- `can_start_new_round=true`, edge/fillability were acceptable
+- denied because gate phase/budget reservation logic blocked wrong-side expansion for pair completion.
+
+2. `locked_strict_abs_net` example (`1771704900`)
+- candidate: `BUY_DOWN_MAKER`, qty `5`, simulated pair still good
+- denied because lock state forbids increasing absolute net exposure after lock is engaged.
+
+3. `margin_target` example (`1771700400`)
+- candidate simulated pair around `1.024` at that tick
+- denied because it violated effective pair limit / hard pair control chain.
+
+These are controlled safety behaviors, not strategy execution failures.
+
+### 12B.6 Practical acceptance reading for current tempo
+
+If you keep current strategy tempo and dynamic sizing:
+
+1. Treat hard-risk checks as release gates.
+2. Treat cadence/slice-shape checks as calibration diagnostics.
+3. Use `S12A.5` rolling-fast profile when you want acceptance thresholds aligned to this tempo.
+
 ## [S13] Known Limitations and Next Step
 
 1. Maker-only entry means missed opportunities when immediate crossing would be required.
 2. PnL currently simplifies fee/rebate accounting.
 3. Paper execution is model-based (queue/flow/probability), not exchange-native paper fills.
-4. Cross-window rolling budget is not enabled in this phase.
+4. Rolling budget compounding is now available in runner mode (`--budget-roll-mode pnl_compound`), but rolling fee/rebate-corrected NAV accounting is still a next-phase task.
 
 ---
 

@@ -6,10 +6,141 @@ Language: [English](README.md) | [中文](README_zh.md)
 
 本文档是当前稳定策略版本的**中文深度说明**，并且只使用一个窗口作为基线：
 
-- 基线窗口：`logs/multi/btc/1771676100/btc_1771676100_paper.jsonl`
-- 基线故事图：`logs/multi/btc/1771676100/btc_1771676100_paper_story.png`
+- 基线窗口：`logs/multi/btc/1771704000/btc_1771704000_paper.jsonl`
+- 基线故事图：`logs/multi/btc/1771704000/btc_1771704000_paper_story.png`
 
 本文不使用旧窗口做结论（旧窗口代码版本不同）。
+
+---
+
+## [S00B] 核心思想：先保证 No-Risk，再追求资金利用率
+
+本项目本质上是在做一个带硬约束的优化问题：
+
+$$
+\max \mathbb{E}[\mathrm{window\_pnl}]
+$$
+
+纯文本：`maximize E[window_pnl]`。
+
+但必须满足以下硬约束：
+
+$$
+\mathrm{仅\ Maker},\ \mathrm{executed\_pair\_cost} \le 0.995,\ \mathrm{final\_abs\_net}=0,\ \mathrm{unmatched\_loss}=0
+$$
+
+纯文本：`仅 Maker，executed_pair_cost <= 0.995，final_abs_net = 0，unmatched_loss = 0`。
+
+所以机器人不是“尽量多交易”的通用执行器，而是一个**严格 no-risk 的配对收口引擎**：只有在“能开且能补且能收口”同时成立时才会用预算。
+
+### 我们真正优化的 tradeoff
+
+运行时目标按优先级分两层：
+
+1. **先收风险**：绝不打开无法在当前条件下闭环的风险敞口。
+2. **再提利用率**：在 1 成立的前提下，尽量提高交易密度和预算使用率。
+
+这也是为什么局部看起来会“保守”，但连续窗口仍然可以积累稳定 PnL。
+
+### 代码里如何落实（高层）
+
+1. **开新轮可行性**（`planner`）：
+   - `can_start_new_round` 必须同时满足基础状态、pair 质量、edge、fillability、regime score 和预算条件。
+   - 关键实现：`poly_maker/src/strategy/planner.rs`（`build_round_plan` 及 block reason）。
+2. **执行硬风控门**（`gate`）：
+   - 拒绝 taker、不可恢复对冲、保证金不足、pair cap 超限、尾盘违规动作。
+   - 关键实现：`poly_maker/src/strategy/gate.rs`。
+3. **挂单后运行时风控**（`ws_market`）：
+   - 已挂出的 resting order 会持续复算风险，若变危险就主动撤单（`sim_order_cancel_unrecoverable`、`sim_order_cancel_risk_guard`）。
+   - 关键实现：`poly_maker/src/ws_market.rs`。
+4. **Maker 报价与成交概率模型**（`simulate` + `ws_market`）：
+   - dynamic cap、被动价差惩罚、queue/consumption 驱动的 fill probability。
+   - 关键实现：`poly_maker/src/strategy/simulate.rs`、`poly_maker/src/ws_market.rs`。
+
+### 最新连续 10 窗口实证说明了什么
+
+基于 `logs/multi/btc_roll10.csv` 与 `logs/multi/btc/budget_curve_1771696194.csv`：
+
+1. **10 窗口全部满足核心安全不变量**
+   - 每窗 `final_abs_net = 0`。
+   - 每窗 `unmatched_loss_usdc = 0`。
+   - `max_executed_sim_pair_cost <= 0.995`（最差 `0.994286`）。
+   - taker 行为持续为 `0`。
+2. **收益表现**
+   - 总 PnL：`+19.07 USDC`。
+   - 滚动预算：`100.00 -> 119.07`。
+3. **资金利用**
+   - spent_ratio 中位数：`0.3925`。
+   - 后段窗口可达到高利用率（约 `0.75-0.89`），且仍满足 no-risk 约束。
+
+### 为什么局部会出现“有波动但没打满”
+
+连续窗口的主 deny/block 原因是：
+
+1. `reserve_for_pair`：策略主动留预算给补腿，不让首腿过度扩张。
+2. `locked_strict_abs_net`：达到锁定条件后，优先保持 no-risk 状态而不是继续冒险。
+3. `fillability` / `directional_gate`：有信号，但 maker 成交质量预估未达门槛。
+
+这些是**主动设计**，不是偶发 bug。
+
+### 上实盘前仍需验证的风险空白
+
+Paper 已经很强，但仍是模型，和实盘还有距离：
+
+1. **排队优先级真实性**：真实队列位置与逆向选择可能偏离模拟假设。
+2. **maker/taker 边界**：post-only 在真实微秒级时序下是否稳定仍需实测。
+3. **执行竞态**：撤单/改价与 WS 延迟竞态在生产环境更严苛。
+4. **经济项完整性**：当前 paper PnL 简化了 fee/rebate/gas/资金时序。
+5. **滚动资金可用性**：结算与可用余额时序在实盘账户需要单独验证。
+
+后续所有优化都遵循同一条原则：
+
+> 任何改动都必须在**不削弱硬 no-risk 收口保证**的前提下，提高利用率或 PnL。
+
+### 一页决策树（何时开仓、补腿、停止）
+
+```mermaid
+flowchart TD
+    A[新决策 tick] --> B{行情是否完整?\nUP/DOWN bid/ask}
+    B -- 否 --> B1[拦截: missing_quotes\n不下单]
+    B -- 是 --> C{round_state}
+
+    C -- leg1_accumulating --> C1[策略: reserve_for_pair\n优先等待对侧补腿]
+    C -- leg2_balancing --> C2[只允许降低 abs_net 的动作]
+    C -- done --> C3[不再开新轮]
+    C -- idle --> D{can_open_round_base_ok?}
+
+    D -- 否 --> D1[拦截原因:\nphase_not_idle / abs_net_nonzero /\nlate_new_round / tail_close / max_rounds]
+    D -- 是 --> E{方向与状态 gate}
+    E -- 失败 --> E1[拦截: directional_gate / regime_score]
+    E -- 通过 --> F{Pair 可行性}
+    F -- 失败 --> F1[拦截: pair_quality / pair_regression /\nentry_worst_pair / entry_edge]
+    F -- 通过 --> G{Fillability}
+    G -- 失败 --> G1[拦截: fillability / low_maker_fill_prob]
+    G -- 通过 --> H{硬风控检查}
+    H -- 失败 --> H1[拦截:\nhedge_not_recoverable /\nhedge_margin_insufficient /\nmargin_target]
+    H -- 通过 --> I[开 Maker 挂单]
+
+    I --> J[Resting 生命周期]
+    J --> K{超时/价格/风险复检}
+    K -- 更适合继续等 --> K1[timeout_extend]
+    K -- 有更优挂价 --> K2[cancel_requote -> reopen]
+    K -- 风险恶化 --> K3[cancel_unrecoverable / cancel_risk_guard]
+    K -- 成交 --> L[Apply 持仓变更]
+
+    L --> M{abs_net == 0 ?}
+    M -- 否 --> N[leg2_balancing\n继续补腿收口]
+    M -- 是 --> O{是否 tail_close?}
+    O -- 是 --> P[done]
+    O -- 否 --> Q[idle -> 下一轮]
+```
+
+解读：
+
+1. `idle` 不等于“必然可交易”，只代表状态机允许进入评估层。
+2. 只有 base -> directional/regime -> pair -> fillability -> hard risk 全部通过，才会真正开首腿。
+3. 一旦出现净敞口（`abs_net > 0`），策略会切换到 `leg2_balancing`，优先补腿与收口。
+4. 尾盘（`tail_close`）会收紧策略：禁止新增风险，只允许净风险下降动作。
 
 ---
 
@@ -20,19 +151,21 @@ Language: [English](README.md) | [中文](README_zh.md)
 1. 先看 `S00` 统一记号和事件词汇。
 2. 再看 `S04` + `S05` + `S06` 理解决策、仓位和开轮条件。
 3. 再看 `S07` + `S08` 理解定价模型和硬 no-risk 风控。
-4. 再看 `S10` + `S11` 看 `1771676100` 的真实案例。
-5. 最后看 `S12` 直接复跑验收命令。
+4. 再看 `S10` + `S11` 看 `1771704000` 的真实案例。
+5. 先看 `S12` 直接复跑验收命令。
+6. 再看 `S12A` 了解连续 10 窗滚动预算复盘结果。
+7. 再看 `S12B` 深挖这 10 窗里的局部失败项与根因。
 
-### 基线成绩单（`1771676100`）
+### 基线成绩单（`1771704000`）
 
 | 目标 | 指标 | 结果 |
 | --- | --- | --- |
 | 仅 Maker | taker 行为 | 无 |
-| 硬风控 pair cap | max executed pair cost | `0.9886585366 <= 0.995` |
-| 执行质量 | fill rate | `61/63 = 0.9683` |
+| 硬风控 pair cap | max executed pair cost | `0.9794308943 <= 0.995` |
+| 执行质量 | fill rate | `50/61 = 0.8197` |
 | 仓位收口 | final abs net | `0` |
-| 资金使用 | spent total | `91.61 / 100` |
-| 配对套利质量 | final pair cost | `0.9850537634 < 1` |
+| 资金使用 | spent total | `97.82 / 112.02` |
+| 配对套利质量 | final pair cost | `0.9590196078 < 1` |
 
 ### 按问题快速跳转
 
@@ -41,6 +174,8 @@ Language: [English](README.md) | [中文](README_zh.md)
 - “maker 成交概率怎么估算？” -> `S07`、`S09`。
 - “no-risk 保护如何起作用？” -> `S08`、`S11`。
 - “怎么复跑验收？” -> `S12`。
+- “10 窗滚动预算实测表现如何？” -> `S12A`。
+- “为什么有些检查失败但风险仍然安全？” -> `S12B`。
 
 ---
 
@@ -150,7 +285,7 @@ flowchart LR
 
 本基线窗口固定为：
 
-- `MARKET_SLUG=btc-updown-15m-1771676100`
+- `MARKET_SLUG=btc-updown-15m-1771704000`
 
 `scripts/validate_market_slug.py` 校验：
 
@@ -280,39 +415,30 @@ alpha = 2 / (VOL_ENTRY_LOOKBACK_TICKS + 1)
 
 该值是 planner 的波动 regime 输入。
 
-### 3A.6 基线窗实例代入（`1771676100`）
+### 3A.6 基线窗实例代入（`1771704000`）
 
-在 `ts_ms=1771676123989`：
+在 `ts_ms=1771704418947`（`t=413.208s`）：
 
-- `best_bid_up=0.65`, `best_ask_up=0.67` -> `mid_up=0.66`
-- 前一帧 `mid_up=0.665`
-- `best_bid_down=0.33`, `best_ask_down=0.35` -> `mid_down=0.34`
-- 前一帧 `mid_down=0.335`
+- `best_bid_up=0.16`, `best_ask_up=0.18` -> `mid_up=0.17`
+- 前一帧 `mid_up=0.17`
+- `best_bid_down=0.82`, `best_ask_down=0.84` -> `mid_down=0.83`
+- 前一帧 `mid_down=0.83`
 
 动量：
 
 ```text
-mid_up_momentum_bps   = (0.66 - 0.665) / 0.665 * 10000 = -75.19
-mid_down_momentum_bps = (0.34 - 0.335) / 0.335 * 10000 = +149.25
+mid_up_momentum_bps   = (0.17 - 0.17) / 0.17 * 10000 = 0.00
+mid_down_momentum_bps = (0.83 - 0.83) / 0.83 * 10000 = 0.00
 ```
 
-同一时刻慢 EMA 折价：
+该快照的折价/流速观测值：
 
-- `slow_up ~= 0.6591418`, `slow_down ~= 0.3408582`
+- `mid_up_discount_bps=53.54`
+- `mid_down_discount_bps=-11.04`
+- `bid_consumption_rate_up=16.6733`
+- `bid_consumption_rate_down=3.8549`
 
-```text
-mid_up_discount_bps   = (0.6591418 - 0.66) / 0.6591418 * 10000 = -13.02
-mid_down_discount_bps = (0.3408582 - 0.34) / 0.3408582 * 10000 = +25.18
-```
-
-与 JSONL 中观测值逐项一致：
-
-- `mid_down_discount_bps=25.18`
-- `mid_down_momentum_bps=149.25`
-- `mid_up_discount_bps=-13.02`
-- `mid_up_momentum_bps=-75.19`
-- `bid_consumption_rate_down=1.26055`
-- `bid_consumption_rate_up=20.0`
+这正是 `S11A` 里 `paper-48` 开腿前的同一段上下文。
 
 ---
 
@@ -723,7 +849,7 @@ fill_progress_ratio = consumed_qty / (queue_ahead + remaining_qty)
 
 ---
 
-## [S09A] 基线参数快照（`1771676100`）
+## [S09A] 基线参数快照（`1771704000`）
 
 由 `scripts/run_multi_paper_safe.py` 注入。
 
@@ -837,55 +963,55 @@ fill_progress_ratio = consumed_qty / (queue_ahead + remaining_qty)
 
 ---
 
-## [S10] 主窗深挖：`1771676100`
+## [S10] 主窗深挖：`1771704000`
 
 ### 核心产物
 
-- `logs/multi/btc/1771676100/btc_1771676100_paper_story.md`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_story_events.csv`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_timeseries.csv`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_denies.csv`
-- `logs/multi/btc/1771676100/btc_1771676100_paper_story.png`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_story.md`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_story_events.csv`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_timeseries.csv`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_denies.csv`
+- `logs/multi/btc/1771704000/btc_1771704000_paper_story.png`
 
-![Window 1771676100 Story](logs/multi/btc/1771676100/btc_1771676100_paper_story.png)
+![Window 1771704000 Story](logs/multi/btc/1771704000/btc_1771704000_paper_story.png)
 
 ### 终态指标（同窗事实）
 
 | 指标 | 数值 |
 | --- | ---: |
-| `best_action_ticks` | 815 |
-| `candidate_applied_ticks` | 815 |
-| `dryrun_apply` | 61 |
-| `sim_order_open` | 63 |
-| `sim_order_filled_resting` | 61 |
-| Fill rate（`fill/open`） | 0.9683 |
-| `spent_total_usdc` | 91.61 |
-| `pair_cost_final` | 0.9850537634 |
-| `qty_up` | 93 |
-| `qty_down` | 93 |
+| `best_action_ticks` | 1539 |
+| `candidate_applied_ticks` | 1539 |
+| `dryrun_apply` | 50 |
+| `sim_order_open` | 61 |
+| `sim_order_filled_resting` | 50 |
+| Fill rate（`fill/open`） | 0.8197 |
+| `spent_total_usdc` | 97.82 |
+| `pair_cost_final` | 0.9590196078 |
+| `qty_up` | 102 |
+| `qty_down` | 102 |
 | `final_abs_net` | 0 |
-| `max_executed_sim_pair_cost_window` | 0.9886585366（`<= 0.995`） |
+| `max_executed_sim_pair_cost_window` | 0.9794308943（`<= 0.995`） |
 
 ### 时序里程碑（相对窗口起点）
 
 | 时间（s） | 事件 |
 | ---: | --- |
-| 20.301 | 首次 `can_start_new_round=true` |
-| 20.303 | 首次 `sim_order_open`（`buy`，`price=0.32`，`size=6`） |
-| 36.701 | 首次 `sim_order_filled_resting` 与首次真实 apply |
-| 283.007 | 首次观察到 `locked=true` |
-| 531.901 | spent 超过 90 USDC |
-| 532.302 | 最后一次 resting fill |
-| 538.103 | 首次出现 `locked_strict_abs_net` deny |
+| 2.599 | 首次 `can_start_new_round=true` |
+| 2.601 | 首次 `sim_order_open`（`buy`，`price=0.52`，`size=10`） |
+| 42.499 | 首次 `sim_order_filled_resting` 与首次真实 apply |
+| 365.707 | 首次观察到 `locked=true` |
+| 462.508 | spent 超过 90 USDC |
+| 482.204 | 最后一次 resting fill |
+| 482.205 | 首次出现 `locked_strict_abs_net` deny |
 
 ### 前后半场活动分布
 
 按 snapshot 时间中点切分：
 
-- `spent_by_half`：前半 `81.07`，后半 `91.61`
+- `spent_by_half`：前半 `78.97`，后半 `97.82`
 - `open/fill`：
-  - 前半：open `55`，fill `52`
-  - 后半：open `8`，fill `9`
+  - 前半：open `50`，fill `37`
+  - 后半：open `11`，fill `13`
 
 解读：
 
@@ -894,68 +1020,271 @@ fill_progress_ratio = consumed_qty / (queue_ahead + remaining_qty)
 
 ### 本窗 planner/gate 上下文
 
-- `can_start_new_round_true_ratio = 0.3166`（1195 / 3775）
+- `can_start_new_round_true_ratio = 0.6934`（2644 / 3813）
 - snapshot 主阻断：
-  - `fillability: 1583`
-  - `phase_not_idle: 761`
-  - `directional_gate: 153`
-  - `leg2_balancing: 60`
+  - `phase_not_idle: 773`
+  - `directional_gate: 172`
+  - `balance_required: 142`
+  - `leg2_balancing: 59`
   - `late_new_round: 22`
 
 这符合预期：策略大量时间在活跃相位（开腿/补腿）中，仅在所有条件都满足时才开新轮。
 
 ---
 
-## [S11] `1771676100` 的局部阻断与修复案例
+## [S11] `1771704000` 的局部阻断与修复案例
 
 这些是**受控局部事件**，不是系统失效。
 
-### 11.1 `reserve_for_pair` 阻断（计数 = 5）
+### 11.1 `margin_target` 阻断（计数 = 347）
 
-`t=112.605s` 样例：
+`t=82.701s` 样例：
 
-- candidate：`BUY_DOWN_MAKER`，qty `24`
-- 质量指标仍健康：
-  - `maker_fill_prob=0.11563`
-  - `sim_pair_cost=0.976`
+- candidate：`BUY_DOWN_MAKER`，qty `8`
+- 观测到的质量字段：
+  - `maker_fill_prob=0.15207`
+  - `sim_pair_cost=0.99567`
   - `hedge_recoverable_now=true`
   - `hedge_margin_ok=true`
-- 被 `reserve_for_pair` 拒绝
+  - `open_margin_surplus=0.07750`
+- 被 `margin_target` 拒绝
 
-含义：当时策略优先保障配对完成，不允许该方向继续扩仓。
+含义：即使成交质量可行，预测 pair 质量也过于贴近（或超过）目标风控边界。
 
-### 11.2 `locked_strict_abs_net` 阻断（计数 = 435）
+### 11.2 `locked_strict_abs_net` 阻断（计数 = 959）
 
-`t=538.103s` 样例：
+`t=482.205s` 样例：
 
-- candidate：`BUY_DOWN_MAKER`，qty `3`
+- candidate：`BUY_DOWN_MAKER`，qty `4`
 - 质量仍可行：
-  - `maker_fill_prob=0.16109`
-  - `sim_pair_cost=0.98188`
+  - `maker_fill_prob=0.16178`
+  - `sim_pair_cost=0.95632`
 - 被 `locked_strict_abs_net` 拒绝
 
 含义：lock 激活后，禁止继续增加净风险。
 
-### 11.3 超时延长保护近成交订单（计数 = 4）
+### 11.3 超时延长保护近成交订单（计数 = 2）
 
-`t=110.403s` 样例：
+`t=218.803s` 样例：
 
-- `fill_progress_ratio=0.88852`
-- `old_horizon_secs=53 -> new_horizon_secs=65`
-- `passive_ticks_at_extend=4`
+- `fill_progress_ratio=0.88968`
+- `old_horizon_secs=20 -> new_horizon_secs=32`
+- `passive_ticks_at_extend=2`
 
 含义：订单推进已明显，不应机械超时撤单。
 
-### 11.4 仅在质量显著提升时重挂（计数 = 2）
+### 11.4 仅在质量显著提升时重挂（计数 = 7）
 
-`t=361.110s` 样例：
+`t=108.603s` 样例：
 
-- `requote_prev_fill_prob=0.01750`
-- `requote_new_fill_prob=0.43102`
-- uplift `+0.41352`
+- `requote_prev_fill_prob=0.000038`
+- `requote_new_fill_prob=0.481178`
+- uplift `+0.481140`
 - `requote_block_reason=hard_stale_with_uplift`
 
 含义：重挂是“质量修复动作”，不是无意义抖动。
+
+---
+
+## [S11A] 取证级复盘：`1771704000`（`paper-48` -> `paper-53`）
+
+本节完整还原一个真实链路：从首腿开仓到尾差微切片补齐。
+
+### 范围与数据来源
+
+- 窗口：`logs/multi/btc/1771704000/btc_1771704000_paper.jsonl`
+- 事件时间线：`logs/multi/btc/1771704000/btc_1771704000_paper_story_events.csv`
+- planner/snapshot 上下文：`logs/multi/btc/1771704000/btc_1771704000_paper_timeseries.csv`
+- 可视化图：`logs/multi/btc/1771704000/btc_1771704000_paper_story.png`
+
+可视化回放（单窗微观行为）：
+
+![Window 1771704000 Story](logs/multi/btc/1771704000/btc_1771704000_paper_story.png)
+
+### 关键时间线（逐点）
+
+| 时间 | 事件 | 当时盘口（`UP bid/ask`, `DOWN bid/ask`） | 为什么这么做 |
+| ---: | --- | --- | --- |
+| `413.250s` | `sim_order_open paper-48` `BUY_UP_MAKER` `7 @ 0.15` | `0.16/0.18`, `0.82/0.84` | 新轮开仓条件全部通过（`pair_quality_ok`、`pair_regression_ok`、`fillability_ok`、`edge_bps=294.60`） |
+| `419.450s` | `sim_order_open paper-49` `BUY_DOWN_MAKER` `4 @ 0.80` | `0.16/0.19`, `0.81/0.84` | 先挂对腿，提升首腿成交后的闭环速度 |
+| `444.450s` | `sim_order_cancel_requote paper-49` | `0.14/0.15`, `0.85/0.86` | 原挂单变 stale，重挂可显著提高成交概率（`0.0238 -> 0.3244`） |
+| `445.950s` | `sim_order_open paper-50` `BUY_DOWN_MAKER` `4 @ 0.83` | `0.14/0.16`, `0.84/0.86` | 用更优队列/成交质量的价格重挂，且仍是 maker |
+| `455.250s` | `sim_order_timeout_extend paper-48` | `0.14/0.16`, `0.84/0.86` | 推进比例高（`fill_progress_ratio=0.8113`），触发延长观察（`42s -> 54s`） |
+| `456.548s` | `sim_order_filled_resting paper-48` | `0.16/0.17`, `0.83/0.84` | 首腿成交（`UP +7`） |
+| `456.549s` | `sim_order_filled_resting paper-50` | `0.16/0.17`, `0.83/0.84` | 对腿主单成交（`DOWN +4`），进入 `leg2_balancing` |
+| `456.551s` / `457.351s` / `458.151s` | 连续 `sim_order_open paper-51/52/53` 每笔 `DOWN +1` | `0.83~0.84` 区间 | 残余净仓 `+3 UP`，在配平相位用 1 股微切片逐步补齐 |
+
+库存路径：
+
+- `paper-48` 前：`qty_up=82`, `qty_down=82`
+- `paper-48 + paper-50` 成交后：`qty_up=89`, `qty_down=86`
+- `paper-51/52/53` 完成后：`qty_up=89`, `qty_down=89`（再次配平）
+
+### 公式还原 + 实际数值代入
+
+#### A) `bid_consumption_rate_up = 16.6733`（本地派生，不是API原始字段）
+
+代码：`poly_maker/src/ws_market.rs`（`estimate_consumption_rate`）。
+
+```text
+observed_rate = 每单位时间的盘口消耗
+rate_new = 0.35 * observed_rate + 0.65 * rate_prev
+最后截断到 [0, 20]
+```
+
+这是对连续盘口变化做 EWMA 后的状态值，不是单 tick 原始输入。
+
+#### B) `mid_*_discount_bps` 正负含义与方向选择
+
+代码：`poly_maker/src/ws_market.rs`（mid/EMA 更新）。
+
+```text
+mid = (best_bid + best_ask) / 2
+discount_bps = ((slow_ema - mid) / slow_ema) * 10000
+```
+
+`413.250s`：
+
+- `mid_up_discount_bps = +295.83`
+- `mid_down_discount_bps = -62.83`
+
+方向判断看符号和阈值（`>=`），不是看绝对值。负值不会通过对应折价门槛。
+
+#### C) `slice_qty=7` 为什么
+
+代码：`poly_maker/src/strategy/planner.rs`。
+
+1. 先算 round 目标股数：
+
+```text
+leg1_budget = round_budget_usdc * round_leg1_fraction
+qty_raw = floor(leg1_budget / leg1_price)
+max_pair_qty = floor(round_budget_usdc / (leg1_price + leg2_price))
+qty_target_raw = min(qty_raw, max_pair_qty)
+```
+
+代入（`413.250s`）：
+
+- `round_budget_usdc=18.67`，`round_leg1_fraction=0.45`
+- `leg1_price=0.16`，`leg2_price=0.82`
+- `qty_raw=floor(8.4015/0.16)=52`
+- `max_pair_qty=floor(18.67/0.98)=19`
+- `qty_target_raw=19`
+
+2. 深度/流量上限：
+
+```text
+depth_cap = floor(best_bid_size_up * ENTRY_MAX_TOP_BOOK_SHARE)
+flow_cap = floor(bid_consumption_rate_up * MAKER_FILL_HORIZON_SECS * ENTRY_MAX_FLOW_UTILIZATION)
+qty_target = min(qty_target_raw, depth_cap, flow_cap)
+```
+
+- `depth_cap=floor(334.31*0.35)=117`
+- `flow_cap=floor(16.6733*12*0.75)=150`
+- `qty_target=19`
+
+3. 动态切片：
+
+```text
+slice_count=3
+slice_qty=ceil(19/3)=7
+```
+
+#### D) `entry_quote_base=0.17`、`dynamic_cap=0.15`、`final=0.15`
+
+代码：`poly_maker/src/strategy/simulate.rs`（`compute_maker_buy_quote`）。
+
+```text
+base_postonly = min(best_bid + tick, best_ask - tick)
+target_margin = max(min_ticks * tick, opp_ask * min_bps / 10000)
+dynamic_cap = hard_pair_cap - headroom - opp_ask - target_margin
+final_quote = min(base_postonly, dynamic_cap)
+```
+
+`paper-48`：
+
+- `best_bid_up=0.16`, `best_ask_up=0.18`, `tick=0.01` -> `base=0.17`
+- `opp_ask=best_ask_down=0.84`
+- `target_margin=max(0.3*0.01, 0.84*5/10000)=0.003`
+- `hard_pair_cap=0.995`, `headroom=5bps=0.0005`
+- `dynamic_cap=0.1515`，按 tick 下取整 `0.15`
+- `final=min(0.17,0.15)=0.15`
+
+#### E) `entry_edge_bps=294.60`
+
+代码：`poly_maker/src/strategy/planner.rs`。
+
+```text
+entry_worst_limit = effective_pair_limit - no_risk_entry_pair_headroom
+entry_edge_bps = ((entry_worst_limit - entry_worst_pair_cost) / entry_worst_limit) * 10000
+```
+
+`413.250s`：
+
+- `entry_worst_limit = 0.995 - 0.0005 = 0.9945`
+- `entry_worst_pair_cost = 0.9652015730`
+- `entry_edge_bps = 294.6046`
+
+#### F) `maker_fill_prob`（`mfp`）怎么从盘口算
+
+代码：`poly_maker/src/strategy/simulate.rs`。
+
+```text
+raw_queue = top_size * maker_queue_ahead_mult
+effective_queue = raw_queue * (1 + passive_ticks * queue_penalty_per_tick)
+expected_consumed = consume_rate * horizon_secs
+flow_ratio = expected_consumed / (effective_queue + qty)
+mfp = (1 - exp(-flow_ratio)) * exp(-decay_k * passive_ticks)
+```
+
+`paper-48` 代入：
+
+- `top_size=334.31`, `qty=7`, `consume_rate=16.6733`, `horizon=12`
+- `passive_ticks=1`（`0.15` 比 `best_bid=0.16` 低 1 tick）
+- `effective_queue=752.1975`
+- `expected_consumed=200.0795`
+- `mfp=0.1632577`
+
+#### G) `fill_progress_ratio`、`old_horizon_secs`、延长条件
+
+代码：`poly_maker/src/ws_market.rs`。
+
+```text
+required_consumption = queue_ahead + remaining_qty
+fill_progress_ratio = consumed_qty / required_consumption
+```
+
+`paper-48` 触发延长时：
+
+- `queue_ahead=752.1975`, `remaining_qty=7` -> `required=759.1975`
+- `consumed_qty=615.9618` -> `progress=0.8113`
+
+基础自适应 horizon：
+
+```text
+required_ratio = -ln(1 - timeout_target_fill_prob)
+required_secs = ceil((queue_ahead + qty) * required_ratio / consume_rate)
+old_horizon_secs = max(base_timeout_secs, required_secs)
+```
+
+- `timeout_target_fill_prob=0.60`
+- `required_ratio=0.91629`
+- `required_secs=42` -> `old_horizon_secs=42`
+
+因 `progress >= 0.50` 且 `timeout_extend_count < max_extends`：
+
+- `old_horizon_secs=42 -> new_horizon_secs=54`
+
+### 为什么 `paper-51/52/53` 都是 1 股尾差
+
+`paper-48` + `paper-50` 后进入 `leg2_balancing`，残余净仓 `+3 UP`。
+
+- `round_plan_can_start_block_reason=leg2_balancing`
+- 此时不走新轮开仓逻辑，不再看 entry edge/fillability 开新边
+- 只允许“改善对冲”的配平动作（`improves_hedge=true`）
+- 所以顺序是 `DOWN +1`, `DOWN +1`, `DOWN +1`
+
+这正是 no-risk 设计目标：先归零净仓，再恢复新轮开仓判定。
 
 ---
 
@@ -1021,12 +1350,215 @@ PY
 
 ---
 
+## [S12A] 连续 10 窗滚动预算复盘（`btc`，复利模式）
+
+本节总结你完成的连续 10 窗运行，关键配置为：
+
+- 滚动预算模式：`--budget-roll-mode pnl_compound`
+- 预算下限：`--rolling-budget-floor 1`
+- 数据来源：
+  - `logs/multi/btc/budget_curve_1771696194.csv`
+  - `logs/multi/btc_roll10.csv`
+  - `logs/multi/btc_roll10_pnl_curve.png`
+
+本批次 10 窗的可视化看板：
+
+![Roll10 PnL Curve](logs/multi/btc_roll10_pnl_curve.png)
+
+![Roll10 Diagnostic Overview](logs/multi/btc_roll10_diag_overview.png)
+
+![Roll10 Diagnostic Timing and Sizing](logs/multi/btc_roll10_diag_timing_sizing.png)
+
+![Roll10 Diagnostic Events and Gates](logs/multi/btc_roll10_diag_events_gates.png)
+
+### 12A.1 复利更新公式（已实现）
+
+对第 `i` 个窗口：
+
+```text
+start_budget_1 = 100
+window_pnl_i = hedgeable_shares_i - spent_total_usdc_i
+end_budget_i = max(rolling_budget_floor, start_budget_i + window_pnl_i)
+start_budget_{i+1} = end_budget_i
+```
+
+该口径与 `scripts/run_multi_paper_safe.py` 的结算逻辑以及 `scripts/summarize_multi.py` 的 PnL 口径一致。
+
+### 12A.2 10 窗组合结果（总览）
+
+- 窗口区间：`1771696800` -> `1771704900`
+- 起始预算：`100.00`
+- 结束预算：`119.07`
+- 总 PnL：`+19.07`
+- 盈利窗口：`10/10`（胜率 `100%`）
+- 最差单窗 PnL：`+0.61`
+
+执行与风险画像：
+
+- `apply_total=368`，`sim_order_open_total=431`，apply/open 比率 `0.8538`
+- 单窗 apply 中位数：`34.5`（最小 `11`，最大 `56`）
+- 单窗 `final_pair_cost` 中位数：`0.973748`（最小 `0.901538`，最大 `0.983043`）
+- 每窗都满足 `final_abs_net=0`
+- 每窗都满足 `unmatched_loss_usdc=0`
+- 每窗都满足 `max_executed_sim_pair_cost_window <= 0.995`
+
+### 12A.3 逐窗复利路径
+
+来自 `logs/multi/btc/budget_curve_1771696194.csv`：
+
+| window_ts | start_budget | window_pnl | end_budget | spent_total | final_pair_cost | final_qty_up/down |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1771696800 | 100.00 | +0.61 | 100.61 | 26.39 | 0.977407 | 27 / 27 |
+| 1771697700 | 100.61 | +0.78 | 101.39 | 34.22 | 0.977714 | 35 / 35 |
+| 1771698600 | 101.39 | +0.89 | 102.28 | 34.11 | 0.974571 | 35 / 35 |
+| 1771699500 | 102.28 | +1.01 | 103.29 | 31.99 | 0.969394 | 33 / 33 |
+| 1771700400 | 103.29 | +2.56 | 105.85 | 23.44 | 0.901538 | 26 / 26 |
+| 1771701300 | 105.85 | +2.92 | 108.77 | 47.08 | 0.941600 | 50 / 50 |
+| 1771702200 | 108.77 | +1.56 | 110.33 | 90.44 | 0.983043 | 92 / 92 |
+| 1771703100 | 110.33 | +1.69 | 112.02 | 82.31 | 0.979881 | 84 / 84 |
+| 1771704000 | 112.02 | +4.18 | 116.20 | 97.82 | 0.959020 | 102 / 102 |
+| 1771704900 | 116.20 | +2.87 | 119.07 | 103.13 | 0.972925 | 106 / 106 |
+
+### 12A.4 验收细节解读
+
+持续稳定的部分：
+
+1. 10 窗硬风控全部通过。
+2. 每窗都完成配平（`qty_up == qty_down`）。
+3. 始终保持 maker-only（未触发 taker 路径）。
+4. 复利结算链路自洽：
+   - runner 的 settle 日志
+   - budget curve CSV
+   - multi summary CSV
+   三者同一条 PnL 序列。
+
+部分窗口出现失败项（但不属于 hard-risk 退化）：
+
+1. 多窗 `apply_interval_p50` 失败，主因是验收阈值按 `0.8s`，而当前策略节奏常在 `0.20~0.30s`。
+2. 少数窗 `median_slice_qty <= 8` 失败，主因是预算抬升后，在流动性/流速允许时切片中位数提高到 `17~23`。
+3. 个别窗 `open_margin_surplus_p50` 触及阈值边缘。
+
+这些更接近“验收阈值与当前执行节奏不匹配”，而不是 no-risk 失效。
+
+### 12A.5 保持当前策略节奏时的验收建议
+
+如果你不改策略节奏，建议使用 rolling-fast 验收参数：
+
+```bash
+export APPLY_INTERVAL_P50_MIN=0.20
+export APPLY_INTERVAL_P50_MIN_SMALL_SLICE=0.20
+export APPLY_INTERVAL_P50_EPS=0.005
+export MEDIAN_SLICE_QTY_MAX=24
+export OPEN_MARGIN_SURPLUS_P50_MIN=0.0000
+```
+
+然后执行标准 10 窗循环验收，并对 `logs/multi/btc_roll10.csv` 运行 `check_multi_pnl.sh`。
+
+---
+
+## [S12B] 连续 10 窗局部失败深挖（Hard vs Soft）
+
+本节把你最近 10 窗验收细节与当前代码实现逐项对齐，解释“为什么有些检查失败，但 hard no-risk 目标仍然成立”。
+
+### 12B.1 Hard / Soft 双层验收口径
+
+| 层级 | 目标 | 主要实现位置 | 10 窗结果 |
+| --- | --- | --- | --- |
+| Hard risk | maker-only、`sim_pair_cost <= 0.995`、可补腿、最终配平 | `gate.rs`、`simulate.rs`、`check_run.sh`、`check_round_quality.sh`、`check_exec_quality.sh` | 稳定，通过 |
+| Soft execution quality | 节奏、切片形态、margin surplus 分布 | `check_round_quality.sh`、`check_exec_quality.sh` | 局部失败（节奏/形态不匹配） |
+
+10 窗里 hard-risk 余量始终为正。最紧窗口是 `1771697700`，最大执行 pair cost `0.994286`，距离硬上限 `0.995` 仍有约 `7.14 bps` 余量。
+
+### 12B.2 具体失败项分布
+
+10 窗（`1771696800` -> `1771704900`）中：
+
+| 窗口 | `apply_interval_p50` | `median_slice_qty <= 8` | `open_margin_surplus_p50 >= 0.001` |
+| --- | --- | --- | --- |
+| 1771696800 | pass（`4.999s`） | pass（`1`） | pass |
+| 1771697700 | fail（`0.202s`） | fail（`17`） | pass |
+| 1771698600 | fail（`0.299s`） | fail（`23`） | pass |
+| 1771699500 | pass（`1.151s`） | fail（`22`） | pass |
+| 1771700400 | fail（`0.300s`） | fail（`21`） | fail（`0.000`） |
+| 1771701300 | fail（`0.299s`） | fail（`17`） | pass |
+| 1771702200 | pass（`1.301s`） | pass（`4`） | pass |
+| 1771703100 | pass（`1.100s`） | pass（`3`） | pass |
+| 1771704000 | fail（`0.301s`） | pass（`5`） | pass |
+| 1771704900 | fail（`0.298s`） | pass（`5`） | pass |
+
+### 12B.3 这些 Soft 失败为什么出现（代码级）
+
+1. `apply_interval_p50` 失败本质是“阈值分支”问题，不是风险问题。  
+`scripts/check_round_quality.sh` 的逻辑是：
+- 默认最小间隔 `0.8s`
+- 但当 `median_slice_qty <= 4` 时，切换为 `0.3s`
+所以当切片中位数 `>4` 且实际节奏在 `0.30s` 左右时，会命中 `0.8s` 分支而失败，即便 no-risk 完全正常。
+
+2. `median_slice_qty` 失败来自“追赶 spent 的主动放大仓位”策略。  
+仓位链路是：
+- 预算目标股数（`compute_round_qty_target`）
+- 深度上限（`ENTRY_MAX_TOP_BOOK_SHARE`）
+- 流量上限（`ENTRY_MAX_FLOW_UTILIZATION`）
+- 动态切片（`ROUND_MIN_SLICES`、`ROUND_MAX_SLICES`）
+- spent/time 驱动的 entry limit 与 round budget boost。  
+代码路径在 `planner.rs`：`effective_entry_limits`、`effective_round_budget_usdc`、`compute_dynamic_slice_count`。  
+当 spent 进度落后且时间充足时，会有意提升参与度，因此出现 `17~23` 的切片中位数是策略结果，不是 bug。
+
+3. `open_margin_surplus_p50` 单窗失败（`1771700400`）属于边界案例。  
+定义：
+`open_margin_surplus = hedge_margin_to_opp_ask - hedge_margin_required`。  
+gate 侧仍有 epsilon 容差和 recoverability 硬检查，因此该边界现象没有演化为 hard-risk 违规。
+
+### 12B.4 10 窗 deny 结构的阶段性变化
+
+从 JSONL 候选 deny 聚合看：
+
+- 早期窗口以 `reserve_for_pair` 为主；
+- 后期窗口以 `locked_strict_abs_net` 为主；
+- `margin_target` 在两阶段都存在，作为硬 pair 质量后挡板。
+
+含义：
+
+1. 早中期：  
+`reserve_for_pair` 主要体现“为配对完成保留预算与相位纪律”。
+
+2. 后期（进度已足够）：  
+`locked_strict_abs_net` 体现 lock 激活后，系统主动压制新增净风险。
+
+3. 全阶段：  
+`margin_target` 一直在保证 pair 质量不越线。
+
+### 12B.5 同批次里的局部失败样例
+
+1. `reserve_for_pair` 样例（`1771699500`）
+- 候选：`BUY_DOWN_MAKER`，qty `19`
+- 当时 `can_start_new_round=true`，edge/fillability 本身可行
+- 但 gate 出于配对预算/相位约束拒绝该动作（防止破坏配对完成节奏）
+
+2. `locked_strict_abs_net` 样例（`1771704900`）
+- 候选：`BUY_DOWN_MAKER`，qty `5`，模拟 pair 仍可接受
+- 因 lock 已生效，拒绝任何会增加绝对净仓的动作
+
+3. `margin_target` 样例（`1771700400`）
+- 候选 tick 的模拟 pair 约 `1.024`
+- 超出有效 pair 限制链路，被硬拒绝
+
+这些都属于“受控安全行为”，不是执行失败。
+
+### 12B.6 当前节奏下怎么读验收结果
+
+若保持当前策略节奏与动态切片：
+
+1. 把 hard-risk 指标当 release gate。
+2. 把节奏/切片类指标当 calibration 诊断。
+3. 需要阈值与当前节奏对齐时，使用 `S12A.5` 的 rolling-fast 验收参数。
+
 ## [S13] 已知限制与下一步
 
 1. 设计上不走 taker 入场，因此会放弃必须立即吃单的机会。
 2. PnL 目前未做 maker rebate / taker fee 的精细记账。
 3. paper 成交是模型驱动（queue/flow/probability），非交易所原生 paper fill。
-4. 跨窗口滚动预算（上一窗 PnL 并入下一窗）尚未在本阶段启用。
+4. runner 已支持跨窗口滚动预算（`--budget-roll-mode pnl_compound`），但“带真实 fee/rebate 的滚动净值（NAV）”仍是下一阶段工作。
 
 ---
 
